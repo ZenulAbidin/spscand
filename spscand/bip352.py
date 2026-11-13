@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from hashlib import new as hashlib_new, sha256
 from typing import Sequence
 
-from . import bech32
+from . import bech32, native
 from .secp import N, InfinityError, Point
 
 K_MAX = 2323
@@ -124,6 +124,18 @@ def tweak_point(inputs: Sequence[TxInput]) -> Point | None:
 
     The caller checks that the transaction has a taproot output.
     """
+    if not native.available():
+        return tweak_point_py(inputs)
+    try:
+        tweak = native.tweak_from_inputs(inputs)
+    except native.NativeError as exc:
+        if exc.code == native.ERR_SCALAR:
+            raise InvalidScalarError("BIP0352/Inputs hash is not a valid scalar") from None
+        raise
+    return None if tweak is None else Point.parse(tweak)
+
+
+def tweak_point_py(inputs: Sequence[TxInput]) -> Point | None:
     keys = []
     for txin in inputs:
         if spends_future_segwit(txin.prevout_script):
@@ -199,6 +211,10 @@ class Receiver:
             point = Point.from_secret(tweak)
             self._label_points[point.serialize()] = (m, tweak)
             self._label_list.append((m, tweak, point))
+        self._native = None
+        if native.available():
+            self._native = native.Receiver(self.scan_secret, self.spend_pubkey.serialize(),
+                                           sorted(wanted), native.NO_CHANGE_LABEL)
 
     @property
     def scan_pubkey(self) -> Point:
@@ -209,6 +225,29 @@ class Receiver:
         if label is not None:
             spend = spend.add_generator(label_tweak(self.scan_secret, label))
         return encode_address(self.scan_pubkey, spend, network)
+
+    def scan_group(self, tweaks: Sequence[Point], outputs: Sequence[bytes]
+                   ) -> list[tuple[int, Found]]:
+        """Try every tweak against the same outputs: (tweak index, Found) pairs."""
+        if self._native is None:
+            by_key = index_keys(outputs)
+            return [(i, found) for i, tweak in enumerate(tweaks)
+                    for found in self.scan(tweak, outputs, by_key)]
+        try:
+            matches = self._native.scan([t.serialize() for t in tweaks], outputs)
+        except native.NativeError as exc:
+            if exc.code == native.ERR_SCALAR:
+                raise InvalidScalarError("BIP0352/SharedSecret hash is not a valid scalar") from None
+            if exc.code == native.ERR_INFINITY:
+                raise InfinityError("output key is the point at infinity") from None
+            raise
+        return [(t, Found(o, outputs[o], tweak, label)) for t, o, tweak, label in matches]
+
+    def filter_check(self, tweaks: Sequence[Point], filter_data: bytes, block_hash: bytes) -> bool:
+        """May a block with this BIP158 basic filter pay us? Needs libspscan."""
+        if self._native is None:
+            raise RuntimeError("filter matching needs libspscan (make -C libspscan)")
+        return self._native.filter_check([t.serialize() for t in tweaks], filter_data, block_hash)
 
     def scan(self, tweak: Point, outputs: Sequence[bytes],
              by_key: dict[bytes, list[int]] | None = None) -> list[Found]:

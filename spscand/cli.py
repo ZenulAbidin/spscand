@@ -15,7 +15,7 @@ from pathlib import Path
 from . import __version__
 from .backends import NETWORKS, BackendError
 from .bip352 import Receiver, decode_address
-from .config import TEMPLATE, Config
+from .config import BACKENDS, TEMPLATE, Config
 from .secp import N, Point
 from .socks import parse_proxy
 from .store import Store
@@ -84,7 +84,7 @@ def cmd_init(args) -> None:
             key: json.dumps(value) for key, value in (
                 ("backend", args.backend), ("rpc_url", args.rpc_url),
                 ("rpc_cookie", args.rpc_cookie), ("blindbit_url", args.blindbit_url),
-                ("proxy", args.proxy),
+                ("peers", args.peers), ("proxy", args.proxy),
             )
         }))
         config_path.chmod(0o600)
@@ -132,6 +132,11 @@ def cmd_rescan(args) -> None:
     print(f"will rescan from height {height}")
 
 
+def _close(backend) -> None:
+    if hasattr(backend, "close"):
+        backend.close()
+
+
 def _scanner(args, emit=None):
     from .scanner import Scanner
 
@@ -147,7 +152,10 @@ def _scanner(args, emit=None):
 
 def cmd_sync(args) -> None:
     scanner, _, _ = _scanner(args)
-    count = scanner.sync()
+    try:
+        count = scanner.sync()
+    finally:
+        _close(scanner.backend)
     print(f"scanned {count} blocks, now at height {scanner.store.scanned_height()}")
 
 
@@ -195,6 +203,7 @@ def cmd_run(args) -> None:
                 state.error = str(exc)
             delay = min(max(delay * 2, 5), 300)
         stop.wait(delay)
+    _close(scanner.backend)
     if server:
         server.shutdown()
     if webhook:
@@ -215,10 +224,12 @@ def main(argv=None) -> None:
     p.add_argument("--address", help="your silent payment address")
     p.add_argument("--spend-pubkey", help="spend public key, 33-byte hex")
     p.add_argument("--birthday", type=int, help="first block height to scan")
-    p.add_argument("--backend", choices=("core", "blindbit"), default="core")
+    p.add_argument("--backend", choices=BACKENDS, default="core")
     p.add_argument("--rpc-url", default="http://127.0.0.1:8332")
     p.add_argument("--rpc-cookie", default="~/.bitcoin/.cookie")
     p.add_argument("--blindbit-url", default="http://127.0.0.1:8000")
+    p.add_argument("--peer", action="append", default=[], dest="peers", metavar="HOST:PORT",
+                   help="P2P peer for the filters backend, host:port (repeatable)")
     p.add_argument("--proxy", default="", help="SOCKS5 proxy, e.g. socks5h://127.0.0.1:9050")
     p.set_defaults(func=cmd_init)
 

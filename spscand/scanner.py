@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import threading
-from .bip352 import Receiver, index_keys
+
+from . import native
+from .bip352 import Receiver
 from .store import Output, Store
 
 log = logging.getLogger("spscand")
@@ -27,6 +29,17 @@ class Scanner:
         self.backend = backend
         self.emit = emit or (lambda event, data: None)
         self.tip: int | None = None
+        if hasattr(backend, "set_matcher"):
+            backend.set_matcher(self._may_concern_us)
+
+    def _may_concern_us(self, block_hash: str, tweaks, filter_data: bytes) -> bool:
+        """Does a block's BIP158 filter possibly hold a payment to us or a spend of ours?"""
+        key = bytes.fromhex(block_hash)[::-1]
+        if tweaks and self.receiver.filter_check(tweaks, filter_data, key):
+            return True
+        # Basic filters include the scripts spent by the block's inputs.
+        scripts = [bytes.fromhex("5120" + o.pubkey) for o in self.store.outputs(unspent_only=True)]
+        return bool(scripts) and native.gcs_match_any(filter_data, key, scripts)
 
     def start_height(self) -> int:
         scanned = self.store.scanned_height()
@@ -97,18 +110,16 @@ class Scanner:
                     by_key.setdefault(out.key, []).append(out)
             for group in block.groups:
                 keys = [o.key for o in group.outputs]
-                group_index = index_keys(keys)
-                for tweak in group.tweaks:
-                    for match in self.receiver.scan(tweak, keys, group_index):
-                        for out in by_key[match.xonly]:
-                            output = Output(
-                                txid=out.txid, vout=out.vout, amount=out.amount,
-                                pubkey=out.key.hex(), tweak=f"{match.tweak:064x}",
-                                label=match.label, height=block.height,
-                                block_hash=block.hash, spent_txid=None, spent_height=None,
-                            )
-                            if self.store.add_output(output):
-                                received.append(output)
+                for _, match in self.receiver.scan_group(group.tweaks, keys):
+                    for out in by_key[match.xonly]:
+                        output = Output(
+                            txid=out.txid, vout=out.vout, amount=out.amount,
+                            pubkey=out.key.hex(), tweak=f"{match.tweak:064x}",
+                            label=match.label, height=block.height,
+                            block_hash=block.hash, spent_txid=None, spent_height=None,
+                        )
+                        if self.store.add_output(output):
+                            received.append(output)
             for output in self.store.outputs(unspent_only=True):
                 spender = block.spent_outpoints.get((output.txid, output.vout))
                 if spender is None and bytes.fromhex(output.pubkey[:16]) in block.spent_prefixes:

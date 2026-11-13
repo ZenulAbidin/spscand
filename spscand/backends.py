@@ -1,16 +1,19 @@
-"""Block sources: a Bitcoin Core node, or a BlindBit Oracle v2 tweak server."""
+"""Block sources: a Bitcoin Core node, a BlindBit Oracle v2 tweak server, or a
+BlindBit server for tweaks plus P2P peers for compact filters and blocks."""
 
 from __future__ import annotations
 
 import base64
 import gzip
 import json
+import secrets
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 
+from . import p2p
 from .bip352 import InvalidScalarError, TxInput, tweak_point
 from .secp import Point
 from .socks import socks_opener
@@ -230,12 +233,8 @@ class BlindBitBackend:
     def block_hash(self, height: int) -> str:
         return self._indexed("/spent-outputs", height)[0]
 
-    def block(self, height: int) -> Block:
-        tweaks_hash, tweaks = self._indexed("/tweaks", height)
-        utxos_hash, utxos = self._indexed("/utxos", height)
-        spent_hash, spent = self._indexed("/spent-outputs", height)
-        if not tweaks_hash == utxos_hash == spent_hash:
-            raise BackendError(f"block {height} changed while fetching it")
+    def tweaks(self, height: int) -> tuple[str, list[Point]]:
+        block_hash, tweaks = self._indexed("/tweaks", height)
         points = []
         for tweak in tweaks:
             if not tweak.strip("0"):
@@ -244,7 +243,157 @@ class BlindBitBackend:
                 points.append(Point.parse(bytes.fromhex(tweak)))
             except ValueError:
                 raise BackendError(f"invalid tweak in block {height}") from None
+        return block_hash, points
+
+    def block(self, height: int) -> Block:
+        tweaks_hash, points = self.tweaks(height)
+        utxos_hash, utxos = self._indexed("/utxos", height)
+        spent_hash, spent = self._indexed("/spent-outputs", height)
+        if not tweaks_hash == utxos_hash == spent_hash:
+            raise BackendError(f"block {height} changed while fetching it")
         outputs = [TaprootOutput(u["txid"], u["vout"], u["amount"], bytes.fromhex(u["pubkey"]))
                    for u in utxos]
         return Block(height, tweaks_hash, None, [ScanGroup(points, outputs)],
                      spent_prefixes={bytes.fromhex(p) for p in spent})
+
+
+class FilterBackend:
+    """Tweaks from a BlindBit server; BIP158 filters, and only the blocks whose
+    filter matches, from Bitcoin P2P peers (BIP157).
+
+    The tweak server sees every block requested, as with the blindbit backend.
+    A peer serving a block learns that the block interested us, so each block
+    is fetched from a randomly chosen peer over a connection (and Tor circuit)
+    of its own. Filter headers are compared between all reachable peers, so a
+    peer serving a false filter is caught unless every peer lies.
+    """
+
+    name = "filters"
+    BATCH = 1000  # BIP157 allows 1000 filters per request
+
+    def __init__(self, tweak_url: str, peers: list[str], *, proxy: str = "",
+                 timeout: float = 120) -> None:
+        if not peers:
+            raise BackendError("the filters backend needs at least one peer")
+        self.tweak_server = BlindBitBackend(tweak_url, proxy=proxy, timeout=timeout)
+        self.peer_specs = list(peers)
+        self.proxy, self.timeout = proxy, timeout
+        self.chain: str | None = None
+        self.matcher = None
+        self._peers: dict[tuple[str, int], p2p.Peer] = {}
+        self._filters: dict[int, tuple[str, bytes]] = {}
+        self._last_header: tuple[int, bytes] | None = None
+
+    def set_matcher(self, matcher) -> None:
+        """matcher(block_hash, tweaks, filter) -> True if the block may concern us."""
+        self.matcher = matcher
+
+    def close(self) -> None:
+        for address in list(self._peers):
+            self._drop(address)
+
+    def network(self) -> str:
+        self.chain = self.tweak_server.network()
+        self.addresses = [p2p.parse_peer(p, self.chain) for p in self.peer_specs]
+        return self.chain
+
+    def tip(self) -> int:
+        return self.tweak_server.tip()
+
+    def block_hash(self, height: int) -> str:
+        return self.tweak_server.block_hash(height)
+
+    def _connect(self, address: tuple[str, int]) -> p2p.Peer:
+        return p2p.Peer(*address, self.chain, proxy=self.proxy, timeout=self.timeout)
+
+    def _peer(self, address: tuple[str, int]) -> p2p.Peer:
+        if address not in self._peers:
+            self._peers[address] = self._connect(address)
+        return self._peers[address]
+
+    def _drop(self, address: tuple[str, int]) -> None:
+        peer = self._peers.pop(address, None)
+        if peer is not None:
+            peer.close()
+
+    def _fetch_filters(self, start: int) -> None:
+        if self.chain is None:
+            self.network()
+        stop = min(start + self.BATCH - 1, self.tip())
+        if stop < start:
+            raise BackendError(f"block {start} is beyond the tip")
+        stop_hash = self.tweak_server.block_hash(stop)
+        headers, errors = {}, []
+        for address in self.addresses:
+            try:
+                headers[address] = self._peer(address).cfheaders(start, stop_hash)
+            except OSError as exc:
+                self._drop(address)
+                errors.append(f"{address[0]}:{address[1]}: {exc}")
+        if not headers:
+            raise BackendError("no peer served filter headers: " + "; ".join(errors))
+        if len(set(map(repr, headers.values()))) > 1:
+            raise BackendError(f"peers disagree on the filters of blocks {start}-{stop}: "
+                               "one of them is lying, or a reorg is under way")
+        address = secrets.choice(sorted(headers))
+        prev, hashes = headers[address]
+        if len(hashes) != stop - start + 1:
+            raise BackendError(f"{address[0]} sent {len(hashes)} filter headers, not {stop - start + 1}")
+        if self._last_header and self._last_header[0] == start - 1 and self._last_header[1] != prev:
+            raise BackendError(f"filter header chain broken at block {start}")
+        try:
+            filters = self._peer(address).cfilters(start, stop_hash, len(hashes))
+        except OSError as exc:
+            self._drop(address)
+            raise BackendError(f"fetching filters from {address[0]}: {exc}") from None
+        header = prev
+        for offset, ((block_hash, data), want) in enumerate(zip(filters, hashes)):
+            if p2p.dsha256(data) != want:
+                raise BackendError(f"{address[0]} sent a filter for block {start + offset} "
+                                   "that does not match its header")
+            header = p2p.filter_header(want, header)
+            self._filters[start + offset] = (block_hash, data)
+        if filters[-1][0] != stop_hash:
+            raise BackendError(f"{address[0]} served filters for another chain")
+        self._last_header = (stop, header)
+
+    def _filter(self, height: int, block_hash: str) -> bytes:
+        for attempt in range(2):
+            if height not in self._filters:
+                self._fetch_filters(height)
+            filter_hash, data = self._filters.pop(height)
+            if filter_hash == block_hash:
+                return data
+            self._filters.clear()  # the chain changed under us
+            self._last_header = None
+        raise BackendError(f"the tweak server and the peers disagree on block {height}")
+
+    def _download(self, block_hash: str) -> list[p2p.Tx]:
+        errors = []
+        for address in secrets.SystemRandom().sample(self.addresses, len(self.addresses)):
+            try:
+                peer = self._connect(address)
+                try:
+                    raw = peer.block(block_hash)
+                finally:
+                    peer.close()
+                return p2p.parse_block(raw, block_hash)[1]
+            except OSError as exc:
+                errors.append(f"{address[0]}:{address[1]}: {exc}")
+        raise BackendError(f"no peer served block {block_hash}: " + "; ".join(errors))
+
+    def block(self, height: int) -> Block:
+        block_hash, tweaks = self.tweak_server.tweaks(height)
+        data = self._filter(height, block_hash)
+        if self.matcher is None or not self.matcher(block_hash, tweaks, data):
+            return Block(height, block_hash, None, [])
+        outputs, spent = [], {}
+        for tx in self._download(block_hash):
+            if tx.coinbase:
+                continue
+            for outpoint in tx.inputs:
+                spent[outpoint] = tx.txid
+            outputs += [TaprootOutput(tx.txid, n, value, script[2:])
+                        for n, (value, script) in enumerate(tx.outputs)
+                        if len(script) == 34 and script[:2] == b"\x51\x20"]
+        return Block(height, block_hash, None, [ScanGroup(tweaks, outputs)], spent_outpoints=spent)

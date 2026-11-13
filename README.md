@@ -12,11 +12,17 @@ Not audited. Try it with small amounts first.
 - Python 3.11+. No Python packages are needed.
 - libsecp256k1: `apt install libsecp256k1-1` or `brew install secp256k1`. If it is not found, set
   `SPSCAND_LIBSECP256K1` to its path.
+- Recommended: [libspscan](libspscan/), the C scanning library in this repository. Build it with
+  `make -C libspscan` (a C compiler is all it needs); spscand finds it in the checkout, after
+  `make -C libspscan install`, or at `SPSCAND_LIBSPSCAN`. Without it spscand uses its Python code,
+  which is much slower with labels, and the filters backend is unavailable.
 - One block source:
   - **Bitcoin Core 25+** with RPC. It needs block undo data, so a pruned node works only above its
     prune height.
   - **A BlindBit Oracle v2 server** with a full tweak index (`tweaks_full_basic = 1`). For Bitcoin
     Core 31 it must be blindbit-oracle at `f9ab7fd` or later.
+  - **Filters**: a BlindBit server for tweaks, and Bitcoin P2P peers serving compact filters (Core
+    with `blockfilterindex=1` and `peerblockfilters=1`) for filters and blocks.
 
 ## Setup
 
@@ -27,7 +33,8 @@ spscand init --network main --address sp1q... --birthday 870000
 
 `init` reads the scan private key (64 hex characters, derived at `m/352'/0'/0'/1'/0`) from a prompt or
 stdin. Set `--birthday` to the height of your first payment; the default is taproot activation. Then
-choose the backend in `~/.spscand/spscand.toml` and start the scanner:
+choose the backend in `~/.spscand/spscand.toml` (or pass `--backend`, `--blindbit-url` and, for
+filters, `--peer host:port` once per peer to `init`) and start the scanner:
 
 ```bash
 spscand run
@@ -55,15 +62,32 @@ so the server cannot tell which payments are yours. It does learn your IP addres
 your birthday, and when you are online or rescan. It could hide payments by serving incomplete data, so
 run your own server if you can.
 
+With filters (BIP157/158, the strategy in BIP352's appendix), spscand takes only `/tweaks` from
+BlindBit, again for every block, and the block's basic filter from P2P peers. It computes your possible
+output keys, checks them against the filter, and downloads the whole block only on a match, or when the
+filter shows one of your outputs being spent. That peer learns that the block interested you, so each
+block comes from a randomly chosen peer over a connection of its own. Filter headers are compared
+across all reachable peers, so list at least two: a single peer could hide a payment by serving a false
+filter. The P2P connection is unencrypted (no BIP324 yet), so prefer `.onion` peers when you use Tor.
+
 To use Tor, set `proxy = "socks5h://127.0.0.1:9050"` under `[backend]` (or `init --proxy`); it also works
 for a remote Core node. Tor resolves host names, including `.onion`, and proxy environment variables
-are ignored. Each process uses random SOCKS credentials, so Tor gives it circuits of its own
-(`IsolateSOCKSAuth`).
+are ignored. Each process, and with filters each P2P connection, uses random SOCKS credentials, so Tor
+gives it circuits of its own (`IsolateSOCKSAuth`).
 
-Cost with BlindBit, measured on mainnet block 833044 (721 eligible transactions): about 135 kB gzipped
-per block (roughly 0.6 GB a month) and 0.07 s of CPU, or 0.15 s with 10 labels. BlindBit does not say
-which transaction a tweak belongs to, so each label costs a point addition per tweak: 1000 labels take
-about 7 s per block, against 0.14 s with Core.
+Cost per block, measured on mainnet block 833044 (721 eligible transactions, 2105 taproot outputs):
+
+| | Download | CPU with libspscan | CPU in Python |
+|---|---|---|---|
+| Core | (local) | 0.06 s; 0.08 s with 1000 labels | 0.04 s; 0.10 s |
+| BlindBit | 135 kB (about 0.6 GB a month) | 0.05 s; 0.16 s with 1000 labels | 0.07 s; 7.5 s |
+| Filters | 28 kB of tweaks + 31 kB of filter (about 0.26 GB a month), plus each matching block | 0.05 s; 0.22 s | not available |
+
+BlindBit does not say which transaction a tweak belongs to, so each label is tried against every
+output of the block. With filters, each label also adds items to test, and so false matches: on this
+block a needless download (about 1 MB, without witness data) happens with probability 0.2% with no
+labels, 1% with 10 and 9% with 100. With hundreds of labels, filters save little. The Core figures are
+for matching; computing the tweaks from the block takes another 0.07 s.
 
 ## Keys and backups
 
@@ -102,8 +126,8 @@ deliveries are retried for about 6 minutes.
 - Confirmed blocks only: mempool payments are not reported.
 - With BlindBit, spends are matched by an 8-byte key prefix, and the spending txid is unknown.
 - BlindBit has deprecated its JSON API in favour of gRPC, but spscand uses the JSON API.
-- There is no BIP157/158 mode. BlindBit serves no filters, and fetching only the blocks that match one
-  would tell the server which blocks pay you.
+- The filters backend still needs BlindBit for tweaks; peers serve only filters and blocks. With it,
+  amounts and spends come from the downloaded blocks, so spends report the spending txid.
 - A reorg deeper than 1000 blocks stops the scanner until you run `rescan`.
 
 ## Tests
@@ -112,19 +136,23 @@ deliveries are retried for about 6 minutes.
 python3 -m unittest discover -s tests -v
 ```
 
-These run the official vectors, a check of mainnet block 833044 against a real BlindBit index (also over
-SOCKS5 under a `.onion` name), and the scanner logic. The end-to-end test pays spscand on regtest from
-the BIP352 reference sender with P2WPKH, P2SH-P2WPKH, P2PKH and P2TR inputs, then checks labels,
-spending, spend detection, reorgs, rescans, the API and the webhook:
+These run the BIP352 vectors, Core's BIP158 filter vectors, a check of mainnet block 833044 against a
+real BlindBit index (also over SOCKS5 under a `.onion` name), the scanner logic, the filters backend
+against fake peers (including lying ones), and libspscan against the Python code. They use libspscan
+when it is built; `SPSCAND_PURE_PYTHON=1` runs them without it. The end-to-end test pays spscand on
+regtest from the BIP352 reference sender with P2WPKH, P2SH-P2WPKH, P2PKH and P2TR inputs, then checks
+labels, spending, spend detection, reorgs, rescans, the API and the webhook:
 
 ```bash
 python3 tests/regtest_e2e.py --bitcoin-conf /path/to/regtest/bitcoin.conf --workdir ~/spscand-e2e
 ```
 
 `--backend blindbit --blindbit-url URL` runs it against a BlindBit server (`tests/fake_blindbit.py`
-serves BlindBit's JSON from the regtest node). `--via-socks` routes the backend through a test SOCKS5
-server and checks that nothing bypassed it.
+serves BlindBit's JSON from the regtest node). `--backend filters` starts a second regtest node serving
+filters, and checks that only blocks paying or spending your outputs were downloaded. `--via-socks`
+routes the backend through a test SOCKS5 server and checks that nothing bypassed it.
 
 ## License
 
-MIT. `tests/reference` holds unmodified files from bitcoin/bips (see its README).
+MIT. `tests/reference` holds unmodified files from bitcoin/bips and bitcoin/bitcoin, and
+`libspscan/secp256k1` an unmodified libsecp256k1 v0.8.0 (see their READMEs).

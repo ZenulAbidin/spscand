@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import logging
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .socks import parse_proxy
 
 log = logging.getLogger("spscand")
+
+BACKENDS = ("core", "blindbit", "filters")
 
 TEMPLATE = """\
 # spscand configuration. Restart spscand after editing.
@@ -19,6 +21,8 @@ TEMPLATE = """\
 # "core": a local Bitcoin Core node (>= 25). Tweaks are computed locally.
 # "blindbit": a BlindBit Oracle v2 tweak server. It never sees your keys,
 # but it learns which blocks you fetch and could withhold data.
+# "filters": tweaks from a BlindBit server, BIP158 filters and only the
+# matching blocks from Bitcoin P2P peers (BIP157). Needs libspscan.
 type = {backend}
 
 # Bitcoin Core JSON-RPC
@@ -27,8 +31,13 @@ rpc_cookie = {rpc_cookie}
 # rpc_user = ""
 # rpc_password = ""
 
-# BlindBit Oracle v2
+# BlindBit Oracle v2 (also the tweak source for "filters")
 blindbit_url = {blindbit_url}
+
+# P2P peers serving compact filters (Core with blockfilterindex=1 and
+# peerblockfilters=1), for "filters": ["host:port", "xyz.onion:8333"].
+# With two or more, a peer serving false filters is detected.
+peers = {peers}
 
 # SOCKS5 proxy for the backend, e.g. Tor: "socks5h://127.0.0.1:9050".
 # Host names (including .onion) are resolved by the proxy.
@@ -57,6 +66,7 @@ class Config:
     rpc_user: str = ""
     rpc_password: str = ""
     blindbit_url: str = "http://127.0.0.1:8000"
+    peers: list[str] = field(default_factory=list)
     proxy: str = ""
     poll_seconds: float = 30
     api_listen: str = "127.0.0.1:7352"
@@ -78,6 +88,7 @@ class Config:
             rpc_user=backend.get("rpc_user", ""),
             rpc_password=backend.get("rpc_password", ""),
             blindbit_url=backend.get("blindbit_url", cls.blindbit_url),
+            peers=backend.get("peers", []),
             proxy=backend.get("proxy", ""),
             poll_seconds=float(scan.get("poll_seconds", cls.poll_seconds)),
             api_listen=api.get("listen", cls.api_listen),
@@ -85,15 +96,27 @@ class Config:
             webhook_url=webhook.get("url", ""),
             webhook_secret=webhook.get("secret", ""),
         )
-        if config.backend not in ("core", "blindbit"):
+        if config.backend not in BACKENDS:
             raise ValueError(f"unknown backend type {config.backend!r}")
+        if not isinstance(config.peers, list) or not all(isinstance(p, str) for p in config.peers):
+            raise ValueError("[backend] peers must be a list of \"host:port\" strings")
         if config.proxy:
             parse_proxy(config.proxy)
         return config
 
     def make_backend(self):
-        from .backends import BlindBitBackend, CoreBackend
+        from . import native
+        from .backends import BlindBitBackend, CoreBackend, FilterBackend
 
+        if self.backend == "filters":
+            if not native.available():
+                raise ValueError("the filters backend needs libspscan: run make -C libspscan")
+            if not self.peers:
+                raise ValueError("the filters backend needs [backend] peers")
+            if not self.proxy:
+                log.warning("the tweak server and P2P peers see your IP address; set "
+                            "[backend] proxy to reach them over Tor")
+            return FilterBackend(self.blindbit_url, list(self.peers), proxy=self.proxy)
         if self.backend == "blindbit":
             host = urlsplit(self.blindbit_url).hostname
             if not self.proxy and host not in ("127.0.0.1", "::1", "localhost"):

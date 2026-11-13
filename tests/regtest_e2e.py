@@ -9,8 +9,12 @@ Needs a regtest bitcoind (>= 25) with a funded wallet (default: "miner"):
     python3 tests/regtest_e2e.py --bitcoin-conf ~/regtest/bitcoin.conf \
         --workdir ~/spscand-e2e [--backend blindbit --blindbit-url URL] [--via-socks]
 
+--backend filters starts a second regtest node with blockfilterindex and
+peerblockfilters, peered with the first, plus tests/fake_blindbit.py reading
+from it; spscand then gets tweaks from that and filters and blocks over P2P.
+
 --via-socks sends spscand's backend traffic through a local SOCKS5 server under
-a .onion name, and checks that no request bypassed it.
+.onion names, and checks that no request bypassed it.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import shutil
 import subprocess
@@ -83,10 +88,76 @@ class Node:
                 values[key.strip()] = value.strip()
         self.user, self.password = values["rpcuser"], values["rpcpassword"]
         self.base = f"http://127.0.0.1:{values.get('rpcport', 18443)}"
+        self.p2p_port = int(values.get("port", 18444))
 
     def rpc(self, wallet: str | None = None) -> CoreBackend:
         url = self.base + (f"/wallet/{wallet}" if wallet else "")
         return CoreBackend(url, user=self.user, password=self.password)
+
+
+class FilterNode:
+    """A second regtest node serving BIP157 filters, following the first, and a
+    fake BlindBit reading from it (so the tweak server is never ahead of it)."""
+
+    def __init__(self, workdir: Path, node: Node) -> None:
+        self.dir = workdir / "filternode"
+        shutil.rmtree(self.dir, ignore_errors=True)
+        self.dir.mkdir(parents=True)
+        self.p2p_port = 19000 + secrets.randbelow(1000)
+        rpc_port = 20000 + secrets.randbelow(1000)
+        self.conf = self.dir / "bitcoin.conf"
+        self.conf.write_text(
+            "regtest=1\nserver=1\nblockfilterindex=1\npeerblockfilters=1\ndebug=net\n"
+            f"[regtest]\nrpcuser=sp\nrpcpassword={secrets.token_hex(8)}\nrpcport={rpc_port}\n"
+            f"port={self.p2p_port}\nbind=127.0.0.1\nrpcbind=127.0.0.1\nrpcallowip=127.0.0.1\n"
+            f"connect=127.0.0.1:{node.p2p_port}\nlisten=1\n")
+        self.proc = subprocess.Popen(["bitcoind", f"-conf={self.conf}", f"-datadir={self.dir}"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        self.node = Node(self.conf)
+        self.blindbit_port = 18950 + secrets.randbelow(40)
+        self.blindbit = None
+
+    def wait(self, best_hash: str, timeout: float = 60) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                rpc = self.node.rpc()
+                info = rpc.call("getindexinfo").get("basic block filter index", {})
+                if rpc.call("getbestblockhash") == best_hash and info.get("synced"):
+                    return
+            except Exception:  # still starting
+                pass
+            time.sleep(0.3)
+        raise AssertionError("filter node did not catch up")
+
+    def start_blindbit(self) -> str:
+        self.blindbit = subprocess.Popen(
+            [sys.executable, str(ROOT / "tests" / "fake_blindbit.py"), "--bitcoin-conf",
+             str(self.conf), "--port", str(self.blindbit_port)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        url = f"http://127.0.0.1:{self.blindbit_port}"
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                urllib.request.urlopen(url + "/info", timeout=2).read()
+                return url
+            except OSError:
+                time.sleep(0.2)
+        raise AssertionError("fake BlindBit did not start")
+
+    def blocks_served(self) -> list[str]:
+        log = (self.dir / "regtest" / "debug.log").read_text()
+        return re.findall(r"received getdata for: (?:witness-)?block ([0-9a-f]{64})", log)
+
+    def stop(self) -> None:
+        if self.blindbit:
+            self.blindbit.terminate()
+            self.blindbit.wait(10)
+        try:
+            self.node.rpc().call("stop")
+        except Exception:
+            self.proc.terminate()
+        self.proc.wait(60)
 
 
 class Sender:
@@ -200,12 +271,14 @@ class Daemon:
         self.datadir.mkdir(parents=True)
         self.port = 17352 + secrets.randbelow(1000)
         self.token = secrets.token_hex(16)
-        backend = (
-            f'type = "blindbit"\nblindbit_url = "{args.blindbit_url}"\n'
-            if args.backend == "blindbit" else
-            f'type = "core"\nrpc_url = "{args.rpc_url or node.base}"\n'
-            f'rpc_user = "{node.user}"\nrpc_password = "{node.password}"\n'
-        )
+        if args.backend == "blindbit":
+            backend = f'type = "blindbit"\nblindbit_url = "{args.blindbit_url}"\n'
+        elif args.backend == "filters":
+            backend = (f'type = "filters"\nblindbit_url = "{args.blindbit_url}"\n'
+                       f"peers = {json.dumps(args.peers)}\n")
+        else:
+            backend = (f'type = "core"\nrpc_url = "{args.rpc_url or node.base}"\n'
+                       f'rpc_user = "{node.user}"\nrpc_password = "{node.password}"\n')
         if proxy:
             backend += f'proxy = "{proxy}"\n'
         (self.datadir / "spscand.toml").write_text(
@@ -265,7 +338,7 @@ def main() -> None:
     parser.add_argument("--bitcoin-conf", type=Path, required=True)
     parser.add_argument("--workdir", type=Path, required=True)
     parser.add_argument("--miner-wallet", default="miner")
-    parser.add_argument("--backend", choices=("core", "blindbit"), default="core")
+    parser.add_argument("--backend", choices=("core", "blindbit", "filters"), default="core")
     parser.add_argument("--blindbit-url", default="http://127.0.0.1:8000")
     parser.add_argument("--via-socks", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -282,15 +355,29 @@ def main() -> None:
     hooks = Hooks("e2e-secret")
     results: dict = {"backend": args.backend, "via_socks": args.via_socks, "checks": []}
     args.rpc_url = None
+    filter_node = None
+    if args.backend == "filters":
+        filter_node = FilterNode(args.workdir, node)
+        filter_node.wait(chain.call("getbestblockhash"))
+        args.blindbit_url = filter_node.start_blindbit()
+        args.peers = [f"127.0.0.1:{filter_node.p2p_port}"]
     socks = None
+    onions = set()
     if args.via_socks:
         onion = "spscande2e" + "x" * 46 + ".onion"
-        real = urlsplit(args.blindbit_url if args.backend == "blindbit" else node.base)
-        socks = SocksServer({onion: (real.hostname, real.port)})
+        real = urlsplit(args.blindbit_url if args.backend != "core" else node.base)
+        names = {onion: (real.hostname, real.port)}
         if args.backend == "blindbit":
             args.blindbit_url = f"http://{onion}:{real.port}"
+        elif args.backend == "filters":
+            args.blindbit_url = f"http://{onion}:{real.port}"
+            peer_onion = "spscandpeer" + "x" * 45 + ".onion"
+            names[peer_onion] = ("127.0.0.1", filter_node.p2p_port)
+            args.peers = [f"{peer_onion}:{filter_node.p2p_port}"]
         else:
             args.rpc_url = f"http://{onion}:{real.port}"
+        socks = SocksServer(names)
+        onions = set(names)
 
     def check(name: str, condition: bool, detail="") -> None:
         results["checks"].append({"check": name, "ok": bool(condition)})
@@ -316,6 +403,7 @@ def main() -> None:
         sender.mine()
         height = chain.tip()
         daemon.wait_synced(height)
+        payment_block = chain.block_hash(height)
         outputs = daemon.api("/v1/outputs")
         by_tx: dict[str, list] = {}
         for o in outputs:
@@ -370,7 +458,7 @@ def main() -> None:
         sender.mine()
         daemon.wait_synced(chain.tip())
         spent = next(o for o in daemon.api("/v1/outputs") if o["txid"] == target["txid"])
-        expected_spender = spend_txid if args.backend == "core" else None
+        expected_spender = None if args.backend == "blindbit" else spend_txid
         check("spend detected", spent["spent_height"] == chain.tip()
               and spent["spent_txid"] == expected_spender, spent)
         hooks.wait("output.spent", target["txid"])
@@ -383,6 +471,7 @@ def main() -> None:
         reorg_height = chain.tip()
         daemon.wait_synced(reorg_height)
         check("payment before reorg", any(o["txid"] == reorg_txid for o in daemon.api("/v1/outputs")))
+        reorged = {chain.block_hash(reorg_height)}
         chain.call("invalidateblock", chain.block_hash(reorg_height))
         chain.call("generateblock", sender.mine_to, [])
         chain.call("generateblock", sender.mine_to, [])
@@ -404,14 +493,22 @@ def main() -> None:
         after = json.loads(daemon.cli("outputs", "--all"))
         check("rescan reproduces wallet",
               sorted((o["txid"], o["vout"], o["spent_height"]) for o in after) == before)
+        if filter_node:
+            wanted = {payment_block, chain.block_hash(spent["spent_height"]),
+                      chain.block_hash(reorg_height + 2)} | reorged
+            served = filter_node.blocks_served()
+            check("only blocks paying or spending ours were downloaded",
+                  served and set(served) <= wanted, (sorted(set(served)), sorted(wanted)))
         if socks:
             check("all backend traffic went through SOCKS by name",
-                  socks.requests and all(r["kind"] == 3 and r["host"] == onion
+                  socks.requests and all(r["kind"] == 3 and r["host"] in onions
                                          for r in socks.requests), socks.requests[:3])
     finally:
         if daemon.proc.poll() is None:
             daemon.stop()
         node.rpc().call("unloadwallet", sender.name)
+        if filter_node:
+            filter_node.stop()
     print(f"all {len(results['checks'])} checks passed")
     if args.output:
         args.output.write_text(json.dumps(results, indent=1) + "\n")
