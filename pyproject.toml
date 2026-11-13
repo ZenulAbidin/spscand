@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spscand"
+version = "0.1.0"
+description = "Watch-only BIP352 silent payments scanner daemon"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Ali Sherief", email = "ali@notatether.com"}]
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX",
+    "Topic :: Office/Business :: Financial",
+]
+
+[project.urls]
+Source = "https://github.com/ZenulAbidin/spscand"
+
+[project.scripts]
+spscand = "spscand.cli:main"
+
+[tool.setuptools]
+packages = ["spscand"]

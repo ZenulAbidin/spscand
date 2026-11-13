@@ -1,0 +1,30 @@
+# systemd unit for spscand. Create the user and wallet first:
+#   useradd --system --home /var/lib/spscand --create-home spscand
+#   sudo -u spscand spscand --datadir /var/lib/spscand init --network main --address sp1...
+# For the Core backend, add spscand to the group that can read the RPC cookie.
+[Unit]
+Description=spscand silent payments scanner
+After=network-online.target bitcoind.service
+Wants=network-online.target
+
+[Service]
+User=spscand
+ExecStart=/usr/local/bin/spscand --datadir /var/lib/spscand run
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/spscand
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
