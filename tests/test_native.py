@@ -114,6 +114,13 @@ class NativeMatchesPython(unittest.TestCase):
         finally:
             receiver._native = saved
 
+    def test_scan_pubkey(self):
+        rng = random.Random(33)
+        for _ in range(20):
+            secret = _key(rng)
+            handle = native.Receiver(secret, Point.from_secret(_key(rng)).serialize())
+            self.assertEqual(handle.scan_pubkey(), Point.from_secret(secret).serialize())
+
     def test_block_wide(self):
         rng = random.Random(352)
         for labels in ([], [1], [1, 2, 3, 77], list(range(1, 400))):

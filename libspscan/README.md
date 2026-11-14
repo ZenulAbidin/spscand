@@ -15,13 +15,22 @@ Not audited.
 make            # libspscan.so and libspscan.a
 make check      # internal checks, built with libsecp256k1's VERIFY assertions
 make install    # PREFIX=/usr/local; installs spscan.h and libspscan.pc
+make wasm       # spscan.wasm, for browsers (clang and wasm-ld, LLVM 15 or later)
 ```
+
+`spscan.wasm` is a freestanding wasm32 build with no imports: [`wasm/libc.c`](wasm/libc.c)
+supplies the few C library functions it needs (a small allocator, `mem*`, `qsort`).
+[`../web/spscan.js`](../web/spscan.js) is a JavaScript binding for browsers and Node.js, and
+`tests/test_wasm.py` checks it against the native library. On wasm32 the field arithmetic uses
+libsecp256k1's 32-bit code (`USE_FORCE_WIDEMUL_INT64`), which is about three times faster
+there than its emulated 128-bit code: roughly 0.2 ms per tweak in a current browser.
 
 The API is in [`include/spscan.h`](include/spscan.h):
 
 | Function | |
 |---|---|
 | `spscan_receiver_create` | scan key, spend public key and labels; the change label is added unless `SPSCAN_NO_CHANGE_LABEL` |
+| `spscan_receiver_scan_pubkey` | the receiver's scan public key, to check a scan key against an address |
 | `spscan_scan` | try tweaks against a set of taproot outputs; one transaction or a whole block |
 | `spscan_tweak_from_inputs` | `input_hash·A` from a transaction's inputs and prevouts, for full nodes and indexers |
 | `spscan_filter_check` | may a block with this basic filter pay the receiver? |

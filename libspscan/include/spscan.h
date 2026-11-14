@@ -64,6 +64,11 @@ SPSCAN_API int spscan_receiver_create(spscan_receiver **receiver,
 
 SPSCAN_API void spscan_receiver_destroy(spscan_receiver *receiver);
 
+/* The scan public key (scan_key * G, 33 bytes), to check a scan key against
+ * the address it should belong to. */
+SPSCAN_API int spscan_receiver_scan_pubkey(const spscan_receiver *receiver,
+                                           unsigned char out[33]);
+
 /* ---- Scanning ---------------------------------------------------------- */
 
 typedef struct {

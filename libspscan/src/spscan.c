@@ -81,7 +81,7 @@ static uint64_t siphash24(uint64_t k0, uint64_t k1, const unsigned char *m, size
 }
 
 static uint64_t mulhi64(uint64_t a, uint64_t b) {
-#ifdef __SIZEOF_INT128__
+#if defined(__SIZEOF_INT128__) && !defined(__wasm__)  /* wasm32 has no __multi3 */
     return (uint64_t)(((unsigned __int128)a * b) >> 64);
 #else
     uint64_t a_lo = (uint32_t)a, a_hi = a >> 32, b_lo = (uint32_t)b, b_hi = b >> 32;
@@ -280,6 +280,14 @@ struct spscan_receiver {
 static int cmp_u32(const void *a, const void *b) {
     uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
     return (x > y) - (x < y);
+}
+
+int spscan_receiver_scan_pubkey(const spscan_receiver *r, unsigned char out[33]) {
+    secp256k1_ge p;
+    if (r == NULL || out == NULL) return SPSCAN_ERR_ARG;
+    secp256k1_ecmult_gen_ge(&r->ctx->ecmult_gen_ctx, &p, &r->scan_key);
+    secp256k1_eckey_pubkey_serialize33(&p, out);
+    return SPSCAN_OK;
 }
 
 void spscan_receiver_destroy(spscan_receiver *r) {

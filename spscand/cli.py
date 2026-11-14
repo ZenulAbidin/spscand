@@ -211,6 +211,11 @@ def cmd_run(args) -> None:
     log.info("stopped")
 
 
+def cmd_web(args) -> None:
+    from . import web
+    web.run(args)
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(prog="spscand", description="Watch-only BIP352 scanner")
     parser.add_argument("--version", action="version", version=__version__)
@@ -257,6 +262,23 @@ def main(argv=None) -> None:
     p = sub.add_parser("rescan", help="scan again from a height (default: the birthday)")
     p.add_argument("--from", dest="from_height", type=int)
     p.set_defaults(func=cmd_rescan)
+
+    p = sub.add_parser("web", help="public scanning service: web page, block data, scan jobs")
+    p.add_argument("--listen", default="127.0.0.1:7352")
+    p.add_argument("--blindbit-url", default="http://127.0.0.1:8000",
+                   help="BlindBit Oracle v2 with a full tweak index (mainnet)")
+    p.add_argument("--cache", default="~/.spscand/blocks.sqlite", help="block cache (SQLite)")
+    p.add_argument("--static", default=str(Path(__file__).resolve().parent.parent / "web"),
+                   help="directory with the web page")
+    p.add_argument("--rpc-url", default="http://127.0.0.1:8332")
+    p.add_argument("--rpc-cookie", default="", help="Bitcoin Core cookie, for spent status")
+    p.add_argument("--sync-workers", type=int, default=3)
+    p.add_argument("--fill-from", type=int, default=709632,
+                   help="lowest height the cache fills in the background (default: taproot "
+                        "activation); older blocks are fetched when asked for")
+    p.add_argument("--job-workers", type=int, default=2, help="server scans run at once")
+    p.add_argument("--job-threads", type=int, default=4, help="threads per server scan")
+    p.set_defaults(func=cmd_web)
 
     args = parser.parse_args(argv)
     logging.basicConfig(

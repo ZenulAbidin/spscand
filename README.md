@@ -121,6 +121,45 @@ With `[webhook] url` set, spscand POSTs `{"event", "network", "time", "data"}` f
 out); `data` is the output. With a `secret`, the body is signed in `X-Spscand-Signature: sha256=<HMAC-SHA256 hex>`. Failed
 deliveries are retried for about 6 minutes.
 
+## Public scanning service
+
+`spscand web` runs a public site where anyone can scan their own wallet (it runs
+[spscan.bitmixlist.org](https://spscan.bitmixlist.org)). It reads blocks from a BlindBit Oracle v2
+server with a full tweak index (`/full-block`), keeps each block's tweaks and a compact filter of its
+taproot outputs in a SQLite cache, and serves:
+
+| | |
+|---|---|
+| `GET /` | the page in [web/](web/) |
+| `GET /v1/info` | tip, limits, queue length |
+| `GET /v1/blocks?from=H&count=N` | tweaks and output filters for up to 2016 blocks, binary (format in `spscand/web.py`) |
+| `GET /v1/outputs?heights=H1,H2,…` | each transaction's tweak and taproot outputs, for up to 32 blocks |
+| `POST /v1/jobs` | `{"address", "scan_key", "from", "labels"}`: scan on the server; returns `{"id"}` |
+| `GET /v1/jobs/ID`, `DELETE /v1/jobs/ID` | progress and payments (with spent status), or delete them |
+
+The page scans in one of two ways:
+
+- **In the browser** (the default): libspscan compiled to WebAssembly checks every block's tweaks
+  against its filter in web workers, and the page asks `/v1/outputs` only for blocks that may pay it,
+  each mixed with three decoys. The scan key never leaves the browser. The server learns the start
+  height, and roughly which blocks may be interesting among their decoys. About 9 kB of downloads and
+  50 ms of CPU per block (1.3 MB and a few seconds per day of history, split across cores).
+- **On the server**: the visitor sends the scan key, and a worker scans with the native library. The
+  key is kept in memory only (Python cannot promise to wipe its copy), the job and its results are
+  dropped within a day, and nothing about visitors is logged. The operator, and a TLS-terminating proxy
+  in front, can see the key and so the payments, but never spend them. Spent status comes from Bitcoin
+  Core (`--rpc-cookie`).
+
+```bash
+make -C libspscan all wasm   # spscan.wasm: needs clang and wasm-ld (LLVM 15 or later)
+spscand web --blindbit-url http://127.0.0.1:8000 --cache /var/lib/spscan/blocks.sqlite \
+    --rpc-cookie /var/lib/bitcoind/.cookie
+```
+
+The cache fills in the background from the tip back to taproot activation (`--fill-from` sets where
+it stops; older blocks are fetched when asked for). It needs about 3 GB for all of mainnet. Put a
+reverse proxy with TLS and rate limits in front; `contrib/spscan-web.service` is a systemd unit.
+
 ## Limits
 
 - Confirmed blocks only: mempool payments are not reported.
@@ -136,7 +175,8 @@ deliveries are retried for about 6 minutes.
 python3 -m unittest discover -s tests -v
 ```
 
-These run the BIP352 vectors, Core's BIP158 filter vectors, a check of mainnet block 833044 against a
+These run the BIP352 vectors, the WebAssembly build against the native library and the web service
+against a fake BlindBit (both need `make -C libspscan wasm` and Node.js; they are skipped otherwise), Core's BIP158 filter vectors, a check of mainnet block 833044 against a
 real BlindBit index (also over SOCKS5 under a `.onion` name), the scanner logic, the filters backend
 against fake peers (including lying ones), and libspscan against the Python code. They use libspscan
 when it is built; `SPSCAND_PURE_PYTHON=1` runs them without it. The end-to-end test pays spscand on

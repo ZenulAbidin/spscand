@@ -66,6 +66,7 @@ if _lib is not None:
                                             ctypes.c_uint, _c]
     _lib.spscan_receiver_destroy.argtypes = [_vp]
     _lib.spscan_receiver_destroy.restype = None
+    _lib.spscan_receiver_scan_pubkey.argtypes = [_vp, _c]
     _lib.spscan_scan.argtypes = [_vp, _c, _size, _c, _size, ctypes.POINTER(Match),
                                  ctypes.POINTER(_size)]
     _lib.spscan_tweak_from_inputs.argtypes = [ctypes.POINTER(Input), _size, _c]
@@ -103,6 +104,11 @@ class Receiver:
         if getattr(self, "_handle", None) and _lib is not None:
             _lib.spscan_receiver_destroy(self._handle)
             self._handle = None
+
+    def scan_pubkey(self) -> bytes:
+        out = ctypes.create_string_buffer(33)
+        _check("spscan_receiver_scan_pubkey", _lib.spscan_receiver_scan_pubkey(self._handle, out))
+        return out.raw
 
     def scan(self, tweaks: Sequence[bytes], outputs: Sequence[bytes]
              ) -> list[tuple[int, int, int, int | None]]:

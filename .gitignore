@@ -5,3 +5,5 @@ dist/
 libspscan/build/
 libspscan/*.so
 libspscan/*.a
+libspscan/*.wasm
+web/spscan.wasm

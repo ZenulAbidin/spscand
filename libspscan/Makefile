@@ -56,7 +56,37 @@ install: all
 	printf 'prefix=%s\nlibdir=%s\nincludedir=%s\n\nName: libspscan\nDescription: BIP352 silent payment scanning\nVersion: %s\nLibs: -L$${libdir} -lspscan\nCflags: -I$${includedir}\n' \
 		'$(PREFIX)' '$(LIBDIR)' '$(INCLUDEDIR)' '$(VERSION)' > $(DESTDIR)$(LIBDIR)/pkgconfig/libspscan.pc
 
-clean:
-	rm -f build/*.o build/test_spscan build/libspscan-verify.so libspscan.so libspscan.a
+# WebAssembly build for browsers: freestanding wasm32, no libc (wasm/libc.c has
+# the few functions needed), no imports. Needs clang and wasm-ld (LLVM >= 15).
+WASM_CC ?= clang
+WASM_LD ?= wasm-ld
+WASM_CFLAGS = --target=wasm32 -nostdinc -isystem $(shell $(WASM_CC) -print-resource-dir)/include \
+	-isystem wasm/include -std=c99 -O2 -fvisibility=hidden $(WARN) -DUSE_FORCE_WIDEMUL_INT64=1
+WASM_EXPORTS = spscan_version spscan_receiver_create spscan_receiver_destroy \
+	spscan_receiver_scan_pubkey spscan_scan \
+	spscan_gcs_match_any spscan_filter_check malloc free
+WASM_OBJS = build/wasm/spscan.o build/wasm/precomputed_ecmult.o build/wasm/precomputed_ecmult_gen.o \
+	build/wasm/libc.o
 
-.PHONY: all check install clean
+wasm: spscan.wasm
+
+build/wasm:
+	mkdir -p build/wasm
+
+build/wasm/spscan.o: src/spscan.c include/spscan.h | build/wasm
+	$(WASM_CC) $(WASM_CFLAGS) $(SECP_FLAGS) -c $< -o $@
+
+build/wasm/precomputed_%.o: $(SECP)/precomputed_%.c | build/wasm
+	$(WASM_CC) $(WASM_CFLAGS) $(SECP_FLAGS) -w -c $< -o $@
+
+build/wasm/libc.o: wasm/libc.c | build/wasm
+	$(WASM_CC) $(WASM_CFLAGS) -fno-builtin -c $< -o $@
+
+spscan.wasm: $(WASM_OBJS)
+	$(WASM_LD) --no-entry --strip-all -z stack-size=1048576 \
+		$(addprefix --export=,$(WASM_EXPORTS)) -o $@ $(WASM_OBJS)
+
+clean:
+	rm -f build/*.o build/wasm/*.o build/test_spscan build/libspscan-verify.so libspscan.so libspscan.a spscan.wasm
+
+.PHONY: all check install clean wasm

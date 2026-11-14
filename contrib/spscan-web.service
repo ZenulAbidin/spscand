@@ -1,0 +1,33 @@
+# systemd unit for the public scanning service (spscand web). It keeps no wallet;
+# its block cache can be deleted and rebuilt at any time.
+#   useradd --system --home /var/lib/spscan --create-home spscan
+# For spent status, add the user to the group that can read the RPC cookie.
+[Unit]
+Description=spscan public silent payments scanner
+After=network-online.target bitcoind.service
+Wants=network-online.target
+
+[Service]
+User=spscan
+ExecStart=/usr/local/bin/spscand web --listen 127.0.0.1:7352 \
+    --blindbit-url http://127.0.0.1:8000 --cache /var/lib/spscan/blocks.sqlite \
+    --rpc-cookie /var/lib/bitcoind/.cookie
+Restart=on-failure
+RestartSec=30
+Nice=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/spscan
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

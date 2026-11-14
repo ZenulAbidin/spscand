@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<title>Silent payments scanner</title>
+<meta name="description" content="Find payments to your silent payment (sp1) address. Scan in your browser; your key stays on your device.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header>
+  <h1>Silent payments scanner</h1>
+  <p>Find payments to your silent payment address (<span class="mono">sp1…</span>).</p>
+</header>
+<main>
+<form id="form" autocomplete="off">
+  <label for="address">Address</label>
+  <input id="address" required placeholder="sp1q…" spellcheck="false" autocapitalize="off">
+
+  <label for="key">Scan private key</label>
+  <input id="key" type="password" required placeholder="64 hex characters" spellcheck="false" autocapitalize="off">
+  <p class="hint">It shows payments; it cannot spend them. Never type your seed words or spend key here.</p>
+
+  <label for="date">Start from</label>
+  <div class="row">
+    <input id="date" type="date" min="2021-11-14" aria-label="Start date">
+    <span>or block</span>
+    <input id="height" inputmode="numeric" placeholder="e.g. 850000" aria-label="Start block height">
+  </div>
+  <p class="hint">When the wallet was made. Earlier means a longer scan. Latest block: <span id="tip">…</span></p>
+
+  <details>
+    <summary>Labels</summary>
+    <input id="labels" placeholder="e.g. 1, 2, 3" aria-label="Labels" spellcheck="false">
+    <p class="hint">Only if your wallet uses labelled addresses. Change (label 0) is always included.</p>
+  </details>
+
+  <fieldset>
+    <legend>Where to scan</legend>
+    <label class="choice"><input type="radio" name="mode" value="browser" id="mode-browser" checked>
+      <span><b>In this browser.</b> Your key stays on this device. Good for weeks or months.</span></label>
+    <label class="choice"><input type="radio" name="mode" value="server" id="mode-server">
+      <span><b>On our server.</b> Faster, for long histories. Your key is sent to our server (through Cloudflare),
+      so we could see your payments, but never spend them. Deleted within 24 hours.</span></label>
+    <label class="choice" id="consent" hidden><input type="checkbox" id="agree">
+      <span>I understand the server will see my payments.</span></label>
+  </fieldset>
+
+  <div class="row">
+    <button id="start" type="submit" disabled>Scan</button>
+    <button id="stop" type="button" hidden>Stop</button>
+  </div>
+</form>
+
+<section id="status" hidden aria-live="polite">
+  <progress id="bar" max="1" value="0"></progress>
+  <p id="progress"></p>
+  <p id="error" role="alert" hidden></p>
+  <button id="forget" type="button" hidden>Delete from server now</button>
+</section>
+
+<section id="results" hidden>
+  <h2>Payments</h2>
+  <p id="total"></p>
+  <div class="table">
+    <table>
+      <thead><tr><th>Block</th><th>Output</th><th class="num">BTC</th><th>Label</th><th id="spent-head" hidden>Status</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+</section>
+</main>
+<footer>
+  <p>Block data comes from our own Bitcoin node. No visitor logs. Needs JavaScript and WebAssembly.</p>
+  <p>Open source: <a href="https://github.com/ZenulAbidin/spscand" rel="noreferrer noopener">github.com/ZenulAbidin/spscand</a> · <a href="https://bitmixlist.org/" rel="noreferrer noopener">BitMixList</a></p>
+</footer>
+</body>
+</html>
