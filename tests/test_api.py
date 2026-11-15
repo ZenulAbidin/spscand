@@ -9,7 +9,7 @@ from pathlib import Path
 
 from spscand import __version__
 from spscand.api import State, serve
-from spscand.store import Store
+from spscand.store import Output, Store
 
 
 class ApiTest(unittest.TestCase):
@@ -60,6 +60,31 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["version"], __version__)
         self.assertIsNone(body["scanned_height"])
+
+    def test_outputs_since_height(self):
+        def output(txid, height, spent_height=None):
+            return Output(txid=txid * 64, vout=0, amount=1000, pubkey="ab" * 32,
+                          tweak="cd" * 32, label=None, height=height, block_hash="00" * 32,
+                          spent_txid=None, spent_height=spent_height)
+
+        with self.store.transaction():
+            self.store.add_output(output("a", 5))
+            self.store.add_output(output("b", 5, spent_height=12))
+            self.store.add_output(output("c", 10))
+            self.store.record_block(12, "11" * 32)
+        base = self.serve()
+
+        def txids(query):
+            status, body = self.get(f"{base}/v1/outputs?{query}")
+            self.assertEqual(status, 200)
+            return [row["txid"][0] for row in body]
+
+        self.assertEqual(txids(""), ["a", "b", "c"])
+        self.assertEqual(txids("since_height=10"), ["b", "c"])
+        self.assertEqual(txids("since_height=13"), [])
+        self.assertEqual(txids("since_height=10&unspent=1"), ["c"])
+        self.assertEqual(self.get(f"{base}/v1/outputs?since_height=-1")[0], 400)
+        self.assertEqual(self.get(f"{base}/v1/outputs?since_height=x")[0], 400)
 
 
 if __name__ == "__main__":

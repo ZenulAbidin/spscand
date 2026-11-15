@@ -29,14 +29,25 @@ class State:
         self.lock = threading.Lock()
 
 
-def _read(path: Path, unspent_only: bool | None) -> tuple[list[Output], int | None]:
-    """(outputs, scanned height); outputs are skipped if unspent_only is None."""
+def _read(path: Path, unspent_only: bool | None,
+          since_height: int | None = None) -> tuple[list[Output], int | None]:
+    """(outputs, scanned height); outputs are skipped if unspent_only is None.
+
+    With since_height, only outputs received or spent at or above that height.
+    """
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
     try:
         outputs = []
         if unspent_only is not None:
-            where = "WHERE spent_height IS NULL" if unspent_only else ""
-            rows = db.execute(f"SELECT * FROM outputs {where} ORDER BY height, txid, vout")
+            conditions, params = [], []
+            if unspent_only:
+                conditions.append("spent_height IS NULL")
+            if since_height is not None:
+                conditions.append("(height >= ? OR spent_height >= ?)")
+                params += [since_height, since_height]
+            where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            rows = db.execute(f"SELECT * FROM outputs {where} ORDER BY height, txid, vout",
+                              params)
             outputs = [Output(*row) for row in rows]
         row = db.execute("SELECT value FROM meta WHERE key = 'scanned_height'").fetchone()
         return outputs, int(row[0]) if row else None
@@ -102,7 +113,14 @@ def serve(listen: str, db_path: Path, state: State, token: str = "") -> Threadin
             if path in ("/v1/outputs", "/v1/balance"):
                 min_conf = int(query.get("min_conf", "1"))
                 unspent_only = path == "/v1/balance" or query.get("unspent") in ("1", "true")
-                outputs, scanned = _read(db_path, unspent_only)
+                since = query.get("since_height")
+                if since is not None and path == "/v1/outputs":
+                    since = int(since)
+                    if since < 0:
+                        raise ValueError("since_height must not be negative")
+                else:
+                    since = None
+                outputs, scanned = _read(db_path, unspent_only, since)
                 tip = state.tip if state.tip is not None else scanned
                 rows = [o.as_dict(tip) for o in outputs]
                 if path == "/v1/outputs":

@@ -111,7 +111,7 @@ Read-only HTTP on `127.0.0.1:7352`. If `[api] token` is set, send `Authorization
 |---|---|
 | `GET /v1/status` | spscand version, network, backend, scanned height, tip, last error |
 | `GET /v1/addresses` | the address and each label's address |
-| `GET /v1/outputs[?unspent=1]` | found outputs with confirmations |
+| `GET /v1/outputs[?unspent=1][&since_height=H]` | found outputs with confirmations; with `since_height`, only those received or spent at height H or later (after a reorg, fetch all again) |
 | `GET /v1/balance[?min_conf=N]` | unspent total in satoshis |
 
 ## Webhook
