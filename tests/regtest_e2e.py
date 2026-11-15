@@ -199,23 +199,27 @@ class Sender:
     def mine(self, count: int = 1) -> list[str]:
         return self.miner.call("generatetoaddress", count, self.mine_to)
 
-    def pay(self, coins: list[dict], recipients: list[dict]) -> str:
-        """Pay PAY to each silent payment recipient from exactly these coins."""
+    def pay(self, coins: list[dict], recipients: list[dict], *, fee: Decimal = FEE,
+            replaceable: bool = False, broadcast: bool = True) -> str:
+        """Pay PAY to each silent payment recipient from exactly these coins.
+        Returns the txid, or the signed hex if broadcast is False."""
         keys = reference.create_outputs(
             [(Scalar(c["secret"]), c["xonly"]) for c in coins],
             [COutPoint(deser_txid(c["txid"]), c["vout"]) for c in coins],
             recipients,
-        )
+        ) if recipients else []
         assert len(keys) == len(recipients), "reference sender produced no outputs"
         outputs = [{p2tr_address(bytes.fromhex(k)): str(PAY)} for k in keys]
-        change = sum(c["amount"] for c in coins) - PAY * len(keys) - FEE
+        change = sum(c["amount"] for c in coins) - PAY * len(keys) - fee
         outputs.append({self.mine_to: str(change)})
         raw = self.wallet.call(
             "createrawtransaction",
-            [{"txid": c["txid"], "vout": c["vout"]} for c in coins], outputs,
+            [{"txid": c["txid"], "vout": c["vout"]} for c in coins], outputs, 0, replaceable,
         )
         signed = self.wallet.call("signrawtransactionwithwallet", raw)
         assert signed["complete"], signed
+        if not broadcast:
+            return signed["hex"]
         return self.wallet.call("sendrawtransaction", signed["hex"])
 
 
@@ -279,10 +283,15 @@ class Daemon:
         else:
             backend = (f'type = "core"\nrpc_url = "{args.rpc_url or node.base}"\n'
                        f'rpc_user = "{node.user}"\nrpc_password = "{node.password}"\n')
+        if args.mempool and args.backend != "core":
+            backend += (f'rpc_url = "{node.base}"\n'
+                        f'rpc_user = "{node.user}"\nrpc_password = "{node.password}"\n')
         if proxy:
             backend += f'proxy = "{proxy}"\n'
+        source = ("core" if args.backend != "core" else "auto") if args.mempool else "off"
         (self.datadir / "spscand.toml").write_text(
             f"[backend]\n{backend}\n[scan]\npoll_seconds = 1\n\n"
+            f'[mempool]\nsource = "{source}"\npoll_seconds = 0.5\n\n'
             f'[api]\nlisten = "127.0.0.1:{self.port}"\ntoken = "{self.token}"\n\n'
             f'[webhook]\nurl = "{hooks.url}"\nsecret = "e2e-secret"\n'
         )
@@ -327,10 +336,72 @@ class Daemon:
             time.sleep(0.3)
         raise AssertionError(f"spscand did not reach height {height}")
 
+    def wait_for(self, what: str, condition, timeout: float = 30):
+        """Poll /v1/outputs until condition(outputs) is true; returns the outputs."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise AssertionError("spscand exited; see spscand.log")
+            outputs = self.api("/v1/outputs")
+            if condition(outputs):
+                return outputs
+            time.sleep(0.2)
+        raise AssertionError(f"timed out waiting for {what}: {outputs}")
+
     def stop(self) -> None:
         self.proc.terminate()
         self.proc.wait(20)
         self.log.close()
+
+
+def mempool_checks(chain, sender, receiver, daemon, hooks, check) -> None:
+    """RBF replacement and a conflicting transaction mined directly."""
+    def unconfirmed(txid):
+        return lambda outs: any(o["txid"] == txid and o["status"] == "unconfirmed"
+                                for o in outs)
+
+    def gone(txid):
+        return lambda outs: all(o["txid"] != txid for o in outs)
+
+    coin = sender.fund("p2wpkh", Decimal(1))
+    keep = sender.fund("p2wpkh", Decimal(1))
+    conflict = sender.fund("p2wpkh", Decimal(1))
+    sender.mine()
+    daemon.wait_synced(chain.tip())
+
+    # A replacement that no longer pays us.
+    first = sender.pay([coin], [recipient(receiver)], replaceable=True)
+    daemon.wait_for("RBF original", unconfirmed(first))
+    sender.pay([coin], [], fee=FEE * 3, replaceable=True)
+    daemon.wait_for("replaced payment gone", gone(first))
+    check("RBF replacement drops the payment",
+          hooks.wait("output.removed", first)["data"]["reason"] == "replaced")
+
+    # A replacement that pays us again: the same output key in a new transaction.
+    first = sender.pay([keep], [recipient(receiver)], replaceable=True)
+    original = daemon.wait_for("RBF original", unconfirmed(first))
+    key = next(o["pubkey"] for o in original if o["txid"] == first)
+    second = sender.pay([keep], [recipient(receiver)], fee=FEE * 3, replaceable=True)
+    now = daemon.wait_for("replacement found", lambda outs: unconfirmed(second)(outs)
+                          and gone(first)(outs))
+    check("RBF replacement paying us again is found",
+          [o["pubkey"] for o in now if o["txid"] == second] == [key], now)
+
+    # A conflicting transaction mined directly, never seen in our mempool.
+    first = sender.pay([conflict], [recipient(receiver)])
+    daemon.wait_for("payment to be conflicted", unconfirmed(first))
+    rival = sender.pay([conflict], [], fee=FEE * 2, broadcast=False)
+    chain.call("generateblock", sender.mine_to, [rival])
+    daemon.wait_for("conflicted payment gone", gone(first))
+    check("conflicting block drops the payment",
+          hooks.wait("output.removed", first)["data"]["reason"] == "conflicted")
+
+    sender.mine()
+    daemon.wait_synced(chain.tip())
+    outputs = daemon.api("/v1/outputs")
+    check("replacement confirmed, no stale unconfirmed output",
+          all(o["status"] == "confirmed" for o in outputs)
+          and any(o["txid"] == second for o in outputs), outputs)
 
 
 def main() -> None:
@@ -341,6 +412,9 @@ def main() -> None:
     parser.add_argument("--backend", choices=("core", "blindbit", "filters"), default="core")
     parser.add_argument("--blindbit-url", default="http://127.0.0.1:8000")
     parser.add_argument("--via-socks", action="store_true")
+    parser.add_argument("--no-mempool", dest="mempool", action="store_false",
+                        help="do not watch the mempool (with blindbit or filters, the "
+                             "regtest node is the mempool source)")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     args.workdir.mkdir(parents=True, exist_ok=True)
@@ -353,7 +427,8 @@ def main() -> None:
                         Point.from_secret(spend_secret := secrets.randbelow(N - 1) + 1))
     stranger = Receiver(secrets.randbelow(N - 1) + 1, Point.from_secret(5))
     hooks = Hooks("e2e-secret")
-    results: dict = {"backend": args.backend, "via_socks": args.via_socks, "checks": []}
+    results: dict = {"backend": args.backend, "via_socks": args.via_socks,
+                     "mempool": args.mempool, "checks": []}
     args.rpc_url = None
     filter_node = None
     if args.backend == "filters":
@@ -400,9 +475,30 @@ def main() -> None:
                            [recipient(receiver), recipient(receiver), recipient(receiver, 0)]),
             "someone else": sender.pay([extra], [recipient(stranger)]),
         }
+        ours = {txid for name, txid in payments.items() if name != "someone else"}
+        if args.mempool:
+            pending = daemon.wait_for("unconfirmed payments", lambda outs: {
+                o["txid"] for o in outs if o["status"] == "unconfirmed"} == ours)
+            check("unconfirmed payments listed", len(pending) == 5
+                  and all(o["confirmations"] == 0 and o["height"] is None for o in pending),
+                  pending)
+            balance = daemon.api("/v1/balance")
+            check("unconfirmed not in balance, but pending",
+                  balance["balance"] == 0 and balance["pending_in"] == 5 * int(PAY * COIN),
+                  balance)
+            for txid in ours:
+                hooks.wait("output.unconfirmed", txid)
+            check("unconfirmed webhooks", True)
         sender.mine()
         height = chain.tip()
         daemon.wait_synced(height)
+        if args.mempool:
+            outputs = daemon.wait_for("confirmation", lambda outs: all(
+                o["status"] == "confirmed" for o in outs))
+            check("confirmed once, no unconfirmed copy left",
+                  len(outputs) == 5 and len({(o["txid"], o["vout"]) for o in outputs}) == 5,
+                  outputs)
+            check("pending cleared", daemon.api("/v1/balance")["pending_in"] == 0)
         payment_block = chain.block_hash(height)
         outputs = daemon.api("/v1/outputs")
         by_tx: dict[str, list] = {}
@@ -455,6 +551,14 @@ def main() -> None:
         signed = spender.call("signrawtransactionwithwallet", raw)
         check("found output is spendable", signed["complete"], signed)
         spend_txid = spender.call("sendrawtransaction", signed["hex"])
+        if args.mempool:
+            daemon.wait_for("pending spend", lambda outs: any(
+                o["txid"] == target["txid"] and o["pending_spent_txid"] == spend_txid
+                for o in outs))
+            balance = daemon.api("/v1/balance")
+            check("unconfirmed spend shows as pending_out",
+                  balance["pending_out"] == int(PAY * COIN), balance)
+            hooks.wait("output.spending", target["txid"])
         sender.mine()
         daemon.wait_synced(chain.tip())
         spent = next(o for o in daemon.api("/v1/outputs") if o["txid"] == target["txid"])
@@ -477,16 +581,27 @@ def main() -> None:
         chain.call("generateblock", sender.mine_to, [])
         daemon.wait_synced(reorg_height + 1)
         hooks.wait("output.reorged", reorg_txid)
-        check("reorged payment removed",
-              all(o["txid"] != reorg_txid for o in daemon.api("/v1/outputs")))
+        if args.mempool:
+            back = daemon.wait_for("reorged payment back in the mempool", lambda outs: [
+                o["status"] for o in outs if o["txid"] == reorg_txid] == ["unconfirmed"])
+            check("reorged payment back as unconfirmed", True, back)
+        else:
+            check("reorged payment removed",
+                  all(o["txid"] != reorg_txid for o in daemon.api("/v1/outputs")))
         sender.mine()
         daemon.wait_synced(reorg_height + 2)
-        again = [o for o in daemon.api("/v1/outputs") if o["txid"] == reorg_txid]
+        again = [o for o in daemon.wait_for("re-mined payment", lambda outs: all(
+            o["status"] == "confirmed" for o in outs if o["txid"] == reorg_txid))
+            if o["txid"] == reorg_txid]
         check("payment found again after reorg",
               len(again) == 1 and again[0]["height"] == reorg_height + 2, again)
 
+        if args.mempool:
+            mempool_checks(chain, sender, receiver, daemon, hooks, check)
+
         # Rescan from the birthday reproduces the same wallet.
-        before = sorted((o["txid"], o["vout"], o["spent_height"]) for o in daemon.api("/v1/outputs"))
+        before = sorted((o["txid"], o["vout"], o["spent_height"])
+                        for o in daemon.api("/v1/outputs") if o["status"] == "confirmed")
         daemon.stop()
         daemon.cli("rescan")
         daemon.cli("sync")
@@ -494,8 +609,11 @@ def main() -> None:
         check("rescan reproduces wallet",
               sorted((o["txid"], o["vout"], o["spent_height"]) for o in after) == before)
         if filter_node:
-            wanted = {payment_block, chain.block_hash(spent["spent_height"]),
-                      chain.block_hash(reorg_height + 2)} | reorged
+            # Blocks paying or spending ours, including those of the mempool checks.
+            wanted = {chain.block_hash(h) for o in after
+                      for h in (o["height"], o["spent_height"]) if h is not None} | reorged
+            check("expected blocks paying us", payment_block in wanted
+                  and chain.block_hash(spent["spent_height"]) in wanted)
             served = filter_node.blocks_served()
             check("only blocks paying or spending ours were downloaded",
                   served and set(served) <= wanted, (sorted(set(served)), sorted(wanted)))
