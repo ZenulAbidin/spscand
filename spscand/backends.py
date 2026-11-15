@@ -150,36 +150,44 @@ class CoreBackend:
                 continue
             for vin in tx["vin"]:
                 block.spent_outpoints[(vin["txid"], vin["vout"])] = tx["txid"]
-            outputs = [
-                TaprootOutput(tx["txid"], out["n"], int(out["value"] * 100_000_000),
-                              bytes.fromhex(spk[4:]))
-                for out in tx["vout"]
-                if len(spk := out["scriptPubKey"]["hex"]) == 68 and spk.startswith("5120")
-            ]
-            if not outputs:
-                continue
             try:
-                inputs = [
-                    TxInput(
-                        txid=vin["txid"],
-                        vout=vin["vout"],
-                        script_sig=bytes.fromhex(vin["scriptSig"]["hex"]),
-                        witness=tuple(bytes.fromhex(w) for w in vin.get("txinwitness", ())),
-                        prevout_script=bytes.fromhex(vin["prevout"]["scriptPubKey"]["hex"]),
-                    )
-                    for vin in tx["vin"]
-                ]
+                group = scan_group(tx)
             except KeyError:
                 raise BackendError(
                     f"block {height} lacks prevout data (is the node pruned below it?)"
                 ) from None
-            try:
-                tweak = tweak_point(inputs)
-            except InvalidScalarError:
-                tweak = None
-            if tweak is not None:
-                block.groups.append(ScanGroup([tweak], outputs))
+            if group is not None:
+                block.groups.append(group)
         return block
+
+
+def scan_group(tx: dict) -> ScanGroup | None:
+    """The tweak and taproot outputs of a transaction in Core's verbose JSON
+    (getblock verbosity 3, getrawtransaction verbosity 2), or None if it
+    cannot pay a silent payment. KeyError if the prevouts are missing."""
+    outputs = [
+        TaprootOutput(tx["txid"], out["n"], int(out["value"] * 100_000_000),
+                      bytes.fromhex(spk[4:]))
+        for out in tx["vout"]
+        if len(spk := out["scriptPubKey"]["hex"]) == 68 and spk.startswith("5120")
+    ]
+    if not outputs:
+        return None
+    inputs = [
+        TxInput(
+            txid=vin["txid"],
+            vout=vin["vout"],
+            script_sig=bytes.fromhex(vin["scriptSig"]["hex"]),
+            witness=tuple(bytes.fromhex(w) for w in vin.get("txinwitness", ())),
+            prevout_script=bytes.fromhex(vin["prevout"]["scriptPubKey"]["hex"]),
+        )
+        for vin in tx["vin"]
+    ]
+    try:
+        tweak = tweak_point(inputs)
+    except InvalidScalarError:
+        return None
+    return ScanGroup([tweak], outputs) if tweak is not None else None
 
 
 class BlindBitBackend:
