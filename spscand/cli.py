@@ -10,6 +10,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 
 from . import __version__
@@ -161,6 +162,7 @@ def cmd_sync(args) -> None:
 
 def cmd_run(args) -> None:
     from .api import State, serve
+    from .mempool import MempoolWatcher
     from .webhook import Webhook
 
     db_path, _ = _paths(args)
@@ -178,32 +180,66 @@ def cmd_run(args) -> None:
         ]
 
     state = State(network, config.backend, addresses())
+    watcher = None
+    mempool_core = config.make_mempool_source(scanner.backend)
+    if mempool_core is not None:
+        if mempool_core is not scanner.backend and mempool_core.network() != network:
+            raise SystemExit(f"the mempool node is not on {network}")
+        watcher = MempoolWatcher(mempool_core, scanner)
+        state.mempool = {"source": "core", "transactions": 0, "error": None}
     server = serve(config.api_listen, db_path, state, config.api_token) if config.api_listen else None
 
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
-    log.info("spscand %s watching %s on %s via %s", __version__,
-             scanner.receiver.address(network), network, config.backend)
+    log.info("spscand %s watching %s on %s via %s%s", __version__,
+             scanner.receiver.address(network), network, config.backend,
+             " and the mempool" if watcher else "")
     delay = config.poll_seconds
+    next_sync = 0.0
+    node_tip = None
     while not stop.is_set():
         labels = sorted(scanner.store.labels())
         if labels != sorted(set(scanner.receiver.labels)):
             scanner.receiver = Receiver(scanner.receiver.scan_secret,
                                         scanner.receiver.spend_pubkey, labels=labels)
             state.addresses = addresses()
-        try:
-            scanner.sync(stop)
-            with state.lock:
-                state.tip, state.error = scanner.tip, None
-            delay = config.poll_seconds
-        except BackendError as exc:
-            log.error("%s", exc)
-            with state.lock:
-                state.error = str(exc)
-            delay = min(max(delay * 2, 5), 300)
-        stop.wait(delay)
+        new_block = False
+        # Scan a new block at once only when the mempool node is also the block
+        # source: a BlindBit server or filter peers may not have indexed it yet.
+        if watcher and mempool_core is scanner.backend:
+            try:
+                tip = watcher.core.call("getblockcount")
+                new_block, node_tip = tip != node_tip, tip
+            except BackendError:
+                pass  # reported by the poll below
+        if new_block or time.monotonic() >= next_sync:
+            try:
+                scanner.sync(stop)
+                with state.lock:
+                    state.tip, state.error = scanner.tip, None
+                delay = config.poll_seconds
+            except BackendError as exc:
+                log.error("%s", exc)
+                with state.lock:
+                    state.error = str(exc)
+                delay = min(max(delay * 2, 5), 300)
+            next_sync = time.monotonic() + delay
+        if watcher and not stop.is_set():
+            try:
+                watcher.poll()
+                with state.lock:
+                    state.mempool = {"source": "core", "transactions": len(watcher.known),
+                                     "error": None}
+            except BackendError as exc:
+                log.error("mempool: %s", exc)
+                with state.lock:
+                    state.mempool = dict(state.mempool, error=str(exc))
+        wait = next_sync - time.monotonic()
+        stop.wait(max(0.0, min(wait, config.mempool_poll_seconds) if watcher else wait))
     _close(scanner.backend)
+    if mempool_core is not None and mempool_core is not scanner.backend:
+        _close(mempool_core)
     if server:
         server.shutdown()
     if webhook:

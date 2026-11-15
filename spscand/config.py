@@ -13,6 +13,7 @@ from .socks import parse_proxy
 log = logging.getLogger("spscand")
 
 BACKENDS = ("core", "blindbit", "filters")
+MEMPOOL_SOURCES = ("auto", "core", "off")
 
 TEMPLATE = """\
 # spscand configuration. Restart spscand after editing.
@@ -46,6 +47,14 @@ proxy = {proxy}
 [scan]
 poll_seconds = 30
 
+[mempool]
+# Unconfirmed payments, from a Bitcoin Core node's mempool. "auto": with the
+# "core" backend, that node; otherwise off. "core": the node in rpc_url
+# above, also with "blindbit" or "filters" (BlindBit and P2P filters cannot
+# show unconfirmed payments). "off": confirmed payments only.
+source = "auto"
+poll_seconds = 5
+
 [api]
 # Read-only JSON API. Keep it on loopback; set a token if other local users exist.
 # Listening on any other address needs a token.
@@ -70,6 +79,8 @@ class Config:
     peers: list[str] = field(default_factory=list)
     proxy: str = ""
     poll_seconds: float = 30
+    mempool_source: str = "auto"
+    mempool_poll_seconds: float = 5
     api_listen: str = "127.0.0.1:7352"
     api_token: str = ""
     webhook_url: str = ""
@@ -80,6 +91,7 @@ class Config:
         data = tomllib.loads(path.read_text()) if path.exists() else {}
         backend = data.get("backend", {})
         scan = data.get("scan", {})
+        mempool = data.get("mempool", {})
         api = data.get("api", {})
         webhook = data.get("webhook", {})
         config = cls(
@@ -92,6 +104,8 @@ class Config:
             peers=backend.get("peers", []),
             proxy=backend.get("proxy", ""),
             poll_seconds=float(scan.get("poll_seconds", cls.poll_seconds)),
+            mempool_source=mempool.get("source", cls.mempool_source),
+            mempool_poll_seconds=float(mempool.get("poll_seconds", cls.mempool_poll_seconds)),
             api_listen=api.get("listen", cls.api_listen),
             api_token=api.get("token", ""),
             webhook_url=webhook.get("url", ""),
@@ -99,6 +113,10 @@ class Config:
         )
         if config.backend not in BACKENDS:
             raise ValueError(f"unknown backend type {config.backend!r}")
+        if config.mempool_source not in MEMPOOL_SOURCES:
+            raise ValueError(f"unknown [mempool] source {config.mempool_source!r}")
+        if config.mempool_poll_seconds <= 0:
+            raise ValueError("[mempool] poll_seconds must be positive")
         if not isinstance(config.peers, list) or not all(isinstance(p, str) for p in config.peers):
             raise ValueError("[backend] peers must be a list of \"host:port\" strings")
         if config.proxy:
@@ -107,7 +125,7 @@ class Config:
 
     def make_backend(self):
         from . import native
-        from .backends import BlindBitBackend, CoreBackend, FilterBackend
+        from .backends import BlindBitBackend, FilterBackend
 
         if self.backend == "filters":
             if not native.available():
@@ -124,7 +142,27 @@ class Config:
                 log.warning("the BlindBit server %s sees your IP address; set [backend] "
                             "proxy to reach it over Tor", host)
             return BlindBitBackend(self.blindbit_url, proxy=self.proxy)
+        return self._core()
+
+    def _core(self, proxy: str | None = None):
+        from .backends import CoreBackend
+
+        proxy = self.proxy if proxy is None else proxy
         if self.rpc_user:
             return CoreBackend(self.rpc_url, user=self.rpc_user, password=self.rpc_password,
-                               proxy=self.proxy)
-        return CoreBackend(self.rpc_url, cookie=self.rpc_cookie, proxy=self.proxy)
+                               proxy=proxy)
+        return CoreBackend(self.rpc_url, cookie=self.rpc_cookie, proxy=proxy)
+
+    def make_mempool_source(self, backend):
+        """The Core node to watch the mempool of, or None."""
+        from .backends import CoreBackend
+
+        if self.mempool_source == "off":
+            return None
+        if isinstance(backend, CoreBackend):
+            return backend
+        if self.mempool_source == "auto":
+            return None
+        # The proxy is there for the BlindBit server and peers; a local node is reached directly.
+        local = urlsplit(self.rpc_url).hostname in ("127.0.0.1", "::1", "localhost")
+        return self._core(proxy="" if local else None)
