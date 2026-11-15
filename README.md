@@ -109,10 +109,17 @@ Read-only HTTP on `127.0.0.1:7352`. If `[api] token` is set, send `Authorization
 
 | Endpoint | |
 |---|---|
-| `GET /v1/status` | spscand version, network, backend, scanned height, tip, last error |
+| `GET /v1/status` | spscand version, network, backend, scanned height, tip, last error, and the mempool watcher (`null` without one) |
 | `GET /v1/addresses` | the address and each label's address |
 | `GET /v1/outputs[?unspent=1][&since_height=H]` | found outputs with confirmations; with `since_height`, only those received or spent at height H or later (after a reorg, fetch all again) |
-| `GET /v1/balance[?min_conf=N]` | unspent total in satoshis |
+| `GET /v1/balance[?min_conf=N]` | unspent total in satoshis, plus `pending_in` and `pending_out` |
+
+Each output has a `status`. A `confirmed` one has a height and confirmations. An `unconfirmed` one
+pays us from a transaction still in the mempool: it has `confirmations: 0` and no height, is listed
+with every `since_height`, and is not counted in `balance` but in `pending_in`. When its
+transaction is mined it is listed again as confirmed; if the transaction leaves the mempool unmined
+(replaced, evicted or conflicted) it is no longer listed. `pending_spent_txid` is set while an
+unconfirmed transaction spends the output, and `pending_out` sums confirmed outputs spent that way.
 
 ## Webhook
 

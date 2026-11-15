@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
-from .store import Output
+from .store import MempoolOutput, Output
 
 log = logging.getLogger("spscand")
 
@@ -26,6 +26,8 @@ class State:
         self.addresses = addresses
         self.tip: int | None = None
         self.error: str | None = None
+        # None without a mempool source, else {"source", "transactions", "error"}.
+        self.mempool: dict | None = None
         self.lock = threading.Lock()
 
 
@@ -51,6 +53,19 @@ def _read(path: Path, unspent_only: bool | None,
             outputs = [Output(*row) for row in rows]
         row = db.execute("SELECT value FROM meta WHERE key = 'scanned_height'").fetchone()
         return outputs, int(row[0]) if row else None
+    finally:
+        db.close()
+
+
+def _read_mempool(path: Path) -> tuple[list[MempoolOutput], dict[tuple[str, int], str]]:
+    """(unconfirmed outputs paying us, our outpoints spent in the mempool)."""
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    try:
+        outputs = [MempoolOutput(*row) for row in db.execute(
+            "SELECT * FROM mempool_outputs ORDER BY txid, vout")]
+        spends = {(row[0], row[1]): row[2] for row in db.execute(
+            "SELECT txid, vout, spent_txid FROM mempool_spends")}
+        return outputs, spends
     finally:
         db.close()
 
@@ -99,6 +114,7 @@ def serve(listen: str, db_path: Path, state: State, token: str = "") -> Threadin
                 _, scanned = _read(db_path, None)
                 with state.lock:
                     tip, error = state.tip, state.error
+                    mempool = dict(state.mempool) if state.mempool is not None else None
                 return {
                     "version": __version__,
                     "network": state.network,
@@ -107,6 +123,7 @@ def serve(listen: str, db_path: Path, state: State, token: str = "") -> Threadin
                     "tip": tip,
                     "synced": tip is not None and scanned == tip,
                     "error": error,
+                    "mempool": mempool,
                 }
             if path == "/v1/addresses":
                 return state.addresses
@@ -121,15 +138,27 @@ def serve(listen: str, db_path: Path, state: State, token: str = "") -> Threadin
                 else:
                     since = None
                 outputs, scanned = _read(db_path, unspent_only, since)
+                unconfirmed, pending = _read_mempool(db_path)
                 tip = state.tip if state.tip is not None else scanned
-                rows = [o.as_dict(tip) for o in outputs]
-                if path == "/v1/outputs":
-                    return rows
-                return {
-                    "balance": sum(r["amount"] for r in rows if r["confirmations"] >= min_conf),
-                    "outputs": sum(1 for r in rows if r["confirmations"] >= min_conf),
-                    "min_conf": min_conf,
-                }
+                rows = []
+                for output in outputs:
+                    row = output.as_dict(tip)
+                    row["status"] = "confirmed"
+                    rows.append(row)
+                if path == "/v1/balance":
+                    counted = [r for r in rows if r["confirmations"] >= min_conf]
+                    return {
+                        "balance": sum(r["amount"] for r in counted),
+                        "outputs": len(counted),
+                        "min_conf": min_conf,
+                        "pending_in": sum(o.amount for o in unconfirmed),
+                        "pending_out": sum(r["amount"] for r in rows
+                                           if (r["txid"], r["vout"]) in pending),
+                    }
+                rows += [o.as_dict() for o in unconfirmed]
+                for row in rows:
+                    row["pending_spent_txid"] = pending.get((row["txid"], row["vout"]))
+                return rows
             return None
 
     server = ThreadingHTTPServer((host, int(port)), Handler)

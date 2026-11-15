@@ -9,7 +9,7 @@ from pathlib import Path
 
 from spscand import __version__
 from spscand.api import State, serve
-from spscand.store import Output, Store
+from spscand.store import MempoolOutput, Output, Store
 
 
 class ApiTest(unittest.TestCase):
@@ -85,6 +85,48 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(txids("since_height=10&unspent=1"), ["c"])
         self.assertEqual(self.get(f"{base}/v1/outputs?since_height=-1")[0], 400)
         self.assertEqual(self.get(f"{base}/v1/outputs?since_height=x")[0], 400)
+
+    def test_unconfirmed_outputs_and_pending_balance(self):
+        ours = Output(txid="a" * 64, vout=0, amount=1000, pubkey="ab" * 32, tweak="cd" * 32,
+                      label=None, height=5, block_hash="00" * 32, spent_txid=None,
+                      spent_height=None)
+        incoming = MempoolOutput(txid="b" * 64, vout=1, amount=250, pubkey="ef" * 32,
+                                 tweak="12" * 32, label=3)
+        with self.store.transaction():
+            self.store.add_output(ours)
+            self.store.record_block(6, "11" * 32)
+            self.store.add_mempool_tx("b" * 64, [("c" * 64, 0)], 1, [incoming], [])
+            self.store.add_mempool_tx("d" * 64, [("a" * 64, 0)], 1, [], [("a" * 64, 0)])
+        base = self.serve()
+
+        status, rows = self.get(f"{base}/v1/outputs")
+        self.assertEqual(status, 200)
+        by_txid = {row["txid"][0]: row for row in rows}
+        self.assertEqual(by_txid["a"]["status"], "confirmed")
+        self.assertEqual(by_txid["a"]["confirmations"], 2)
+        self.assertEqual(by_txid["a"]["pending_spent_txid"], "d" * 64)
+        self.assertEqual(by_txid["b"]["status"], "unconfirmed")
+        self.assertEqual(by_txid["b"]["confirmations"], 0)
+        self.assertIsNone(by_txid["b"]["height"])
+        self.assertEqual(by_txid["b"]["label"], 3)
+        self.assertIsNone(by_txid["b"]["pending_spent_txid"])
+        # Unconfirmed outputs are always new.
+        _, rows = self.get(f"{base}/v1/outputs?since_height=100")
+        self.assertEqual([row["txid"][0] for row in rows], ["b"])
+
+        _, balance = self.get(f"{base}/v1/balance")
+        self.assertEqual(balance["balance"], 1000)
+        self.assertEqual(balance["outputs"], 1)
+        self.assertEqual(balance["pending_in"], 250)
+        self.assertEqual(balance["pending_out"], 1000)
+        _, balance = self.get(f"{base}/v1/balance?min_conf=0")
+        self.assertEqual(balance["balance"], 1000)
+
+        _, status_body = self.get(f"{base}/v1/status")
+        self.assertIsNone(status_body["mempool"])
+        self.state.mempool = {"source": "core", "transactions": 12, "error": None}
+        _, status_body = self.get(f"{base}/v1/status")
+        self.assertEqual(status_body["mempool"]["transactions"], 12)
 
 
 if __name__ == "__main__":
