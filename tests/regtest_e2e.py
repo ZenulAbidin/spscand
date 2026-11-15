@@ -336,6 +336,14 @@ class Daemon:
             time.sleep(0.3)
         raise AssertionError(f"spscand did not reach height {height}")
 
+    def post(self, path: str, body: dict):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", data=json.dumps(body).encode(),
+            headers={"Authorization": f"Bearer {self.token}"}, method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read())
+
     def wait_for(self, what: str, condition, timeout: float = 30):
         """Poll /v1/outputs until condition(outputs) is true; returns the outputs."""
         deadline = time.time() + timeout
@@ -598,6 +606,40 @@ def main() -> None:
 
         if args.mempool:
             mempool_checks(chain, sender, receiver, daemon, hooks, check)
+
+        # The API: events, a label added and paid, a rescan started.
+        events = daemon.api("/v1/events?since=0")
+        names = {e["event"] for e in events["events"]}
+        check("events recorded", {"output.received", "output.spent", "block.scanned"} <= names
+              and (not args.mempool or "output.unconfirmed" in names), sorted(names))
+        label = daemon.post("/v1/labels", {"comment": "shop"})
+        check("label added through the API", label["label"] == 2
+              and label["address"] == receiver.address("regtest", 2), label)
+        last = events["last"]
+        labelled = sender.pay([sender.fund("p2wpkh", Decimal(1))], [recipient(receiver, 2)])
+        sender.mine(2)
+        seen, deadline = [], time.time() + 60
+        while time.time() < deadline and not any(
+                e["data"].get("txid") == labelled for e in seen):
+            news = daemon.api(f"/v1/events?since={last}&boot={events['boot']}&wait=30")
+            seen += news["events"]
+            last = news["last"]
+        check("event wait returns the new payment",
+              any(e["data"].get("txid") == labelled for e in seen), seen)
+        daemon.wait_synced(chain.tip())
+        check("payment to the new label found", [
+            o["label"] for o in daemon.api("/v1/outputs") if o["txid"] == labelled] == [2])
+        confirmed = sorted((o["txid"], o["vout"], o["spent_height"])
+                           for o in daemon.api("/v1/outputs") if o["status"] == "confirmed")
+        last = daemon.api("/v1/events")["last"]
+        daemon.post("/v1/rescan", {})
+        started = daemon.api(f"/v1/events?since={last}&wait=30")
+        check("rescan started through the API",
+              any(e["event"] == "rescan.started" for e in started["events"]), started)
+        daemon.wait_synced(chain.tip())
+        check("rescan through the API reproduces the wallet", confirmed == sorted(
+            (o["txid"], o["vout"], o["spent_height"])
+            for o in daemon.api("/v1/outputs") if o["status"] == "confirmed"))
 
         # Rescan from the birthday reproduces the same wallet.
         before = sorted((o["txid"], o["vout"], o["spent_height"])
