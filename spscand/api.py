@@ -30,6 +30,10 @@ class State:
         self.mempool: dict | None = None
         # The address for a label number; set by "spscand run".
         self.address_for = None
+        # A rescan asked for through the API, from this height; "spscand run" acts on it.
+        self.rescan_from: int | None = None
+        # Set to make "spscand run" act at once instead of after its poll interval.
+        self.wake = threading.Event()
         self.lock = threading.Lock()
 
 
@@ -73,6 +77,15 @@ def _read_mempool(path: Path) -> tuple[list[MempoolOutput], dict[tuple[str, int]
 
 
 MAX_BODY = 4096
+
+
+def _meta(path: Path, key: str) -> str | None:
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    try:
+        row = db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+    finally:
+        db.close()
 
 
 def _add_label(path: Path, m: int | None, comment: str) -> int:
@@ -156,7 +169,18 @@ def serve(listen: str, db_path: Path, state: State, token: str = "") -> Threadin
                 with state.lock:
                     state.addresses = [a for a in state.addresses
                                        if a.get("label") != m] + [entry]
+                state.wake.set()  # scan for the new label from now on
                 return entry
+            if path == "/v1/rescan":
+                height = body.get("from")
+                if height is None:
+                    height = int(_meta(db_path, "birthday") or 0)
+                if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+                    raise ValueError("from must be a block height")
+                with state.lock:
+                    state.rescan_from = height
+                state.wake.set()
+                return {"from": height}
             return None
 
         def do_GET(self) -> None:

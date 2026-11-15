@@ -191,8 +191,13 @@ def cmd_run(args) -> None:
     server = serve(config.api_listen, db_path, state, config.api_token) if config.api_listen else None
 
     stop = threading.Event()
+
+    def on_signal(*_):
+        stop.set()
+        state.wake.set()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda *_: stop.set())
+        signal.signal(sig, on_signal)
     log.info("spscand %s watching %s on %s via %s%s", __version__,
              scanner.receiver.address(network), network, config.backend,
              " and the mempool" if watcher else "")
@@ -205,6 +210,14 @@ def cmd_run(args) -> None:
             scanner.receiver = Receiver(scanner.receiver.scan_secret,
                                         scanner.receiver.spend_pubkey, labels=labels)
             state.addresses = addresses()
+        state.wake.clear()  # before reading what may have set it
+        with state.lock:
+            rescan_from, state.rescan_from = state.rescan_from, None
+        if rescan_from is not None:
+            with scanner.store.transaction():
+                scanner.store.rewind(rescan_from - 1)
+            log.info("rescanning from height %d, as asked through the API", rescan_from)
+            next_sync = 0.0
         new_block = False
         # Scan a new block at once only when the mempool node is also the block
         # source: a BlindBit server or filter peers may not have indexed it yet.
@@ -237,7 +250,7 @@ def cmd_run(args) -> None:
                 with state.lock:
                     state.mempool = dict(state.mempool, error=str(exc))
         wait = next_sync - time.monotonic()
-        stop.wait(max(0.0, min(wait, config.mempool_poll_seconds) if watcher else wait))
+        state.wake.wait(max(0.0, min(wait, config.mempool_poll_seconds) if watcher else wait))
     _close(scanner.backend)
     if mempool_core is not None and mempool_core is not scanner.backend:
         _close(mempool_core)

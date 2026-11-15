@@ -169,5 +169,21 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(self.post(f"{base}/v1/nothing", {}, token="s3cret")[0], 404)
 
 
+    def test_rescan_request(self):
+        with self.store.transaction():
+            self.store.set_meta("birthday", "120")
+        base = self.serve(token="s3cret")
+        status, body = self.post(f"{base}/v1/rescan", {}, token="s3cret")
+        self.assertEqual((status, body), (200, {"from": 120}))
+        self.assertEqual(self.state.rescan_from, 120)
+        self.assertTrue(self.state.wake.is_set())
+        status, body = self.post(f"{base}/v1/rescan", {"from": 150}, token="s3cret")
+        self.assertEqual(self.state.rescan_from, 150)
+        for bad in ({"from": -1}, {"from": "150"}, {"from": True}):
+            with self.subTest(bad):
+                self.assertEqual(self.post(f"{base}/v1/rescan", bad, token="s3cret")[0], 400)
+        self.assertEqual(self.post(f"{base}/v1/rescan", {}, token=None)[0], 401)
+
+
 if __name__ == "__main__":
     unittest.main()
