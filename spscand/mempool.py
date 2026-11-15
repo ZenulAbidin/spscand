@@ -44,11 +44,12 @@ class MempoolWatcher:
         tracked = self.store.mempool_txids()
         gone = (tracked | self.known) - txids
         new = txids - self.known - tracked
-        self.known = txids
+        # A transaction counts as known once it has been checked: if a request
+        # fails halfway, the rest are checked on the next poll.
+        self.known = (self.known | tracked) & txids
         for txid in sorted(gone & tracked):
             self._gone(txid)
-        retry = self._scan(sorted(new), txids)
-        self.known -= retry
+        self._scan(sorted(new), txids)
 
     # -- leaving the mempool -------------------------------------------------
 
@@ -122,9 +123,8 @@ class MempoolWatcher:
                     scripts[outpoint] = coin["scriptPubKey"]["hex"]
         return scripts
 
-    def _scan(self, txids: list[str], mempool: set[str]) -> set[str]:
-        """Check new mempool transactions; returns txids to try again next time."""
-        retry: set[str] = set()
+    def _scan(self, txids: list[str], mempool: set[str]) -> None:
+        """Check new mempool transactions, adding each one checked to known."""
         ours = {(o.txid, o.vout) for o in self.store.outputs(unspent_only=True)}
         ours |= {(o.txid, o.vout) for o in self.store.mempool_outputs()}
         for chunk in _chunks(txids):
@@ -140,20 +140,20 @@ class MempoolWatcher:
                 found: list[MempoolOutput] = []
                 if tx["txid"] in taproot_txids:
                     if not all(i in scripts for i in inputs):
-                        retry.add(tx["txid"])  # a parent came or went meanwhile
-                        continue
+                        continue  # a parent came or went meanwhile: next poll
+
                     for vin in tx["vin"]:
                         script = scripts[(vin["txid"], vin["vout"])]
                         vin["prevout"] = {"scriptPubKey": {"hex": script}}
                     found = self._match(tx)
                 spends = [i for i in inputs if i in ours]
-                if not found and not spends:
-                    continue
-                with self.store.transaction():
-                    self.store.add_mempool_tx(tx["txid"], inputs, int(time.time()), found, spends)
-                ours |= {(o.txid, o.vout) for o in found}
-                self._announce(tx["txid"], found, spends)
-        return retry
+                if found or spends:
+                    with self.store.transaction():
+                        self.store.add_mempool_tx(tx["txid"], inputs, int(time.time()),
+                                                  found, spends)
+                    ours |= {(o.txid, o.vout) for o in found}
+                    self._announce(tx["txid"], found, spends)
+                self.known.add(tx["txid"])
 
     def _match(self, tx: dict) -> list[MempoolOutput]:
         group = scan_group(tx)

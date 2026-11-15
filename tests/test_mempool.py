@@ -130,6 +130,23 @@ class MempoolWatcherTest(unittest.TestCase):
         self.watcher.poll()
         self.assertTrue(self.store.mempool_outputs())
 
+    def test_failed_request_is_retried(self):
+        calls = {"n": 0}
+        real = self.core.call_many
+
+        def flaky(method, params):
+            calls["n"] += 1
+            if calls["n"] == 2:  # the prevout lookup of the first poll
+                raise BackendError("cannot reach the node: connection closed")
+            return real(method, params)
+
+        self.core.call_many = flaky
+        with self.assertRaises(BackendError):
+            self.arrive()
+        self.assertEqual(self.store.mempool_outputs(), [])
+        self.watcher.poll()
+        self.assertTrue(self.store.mempool_outputs())
+
     def leave(self):
         del self.core.mempool[self.tx["txid"]]
         self.watcher.poll()
