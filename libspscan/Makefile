@@ -7,7 +7,7 @@ LIBDIR ?= $(PREFIX)/lib
 INCLUDEDIR ?= $(PREFIX)/include
 
 SOVERSION = 0
-VERSION = 0.1.0
+VERSION = 0.1.1
 WARN = -Wall -Wextra -Wno-unused-function -Wno-unused-parameter
 SECP = secp256k1/src
 SECP_FLAGS = -I$(SECP) -I secp256k1/include -DENABLE_MODULE_EXTRAKEYS=1 \

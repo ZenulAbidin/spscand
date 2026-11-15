@@ -31,7 +31,7 @@ static const unsigned char NUMS_H[32] = {
 };
 
 const char *spscan_version(void) {
-    return "0.1.0";
+    return "0.1.1";
 }
 
 /* ---- Hashes -------------------------------------------------------------- */
