@@ -2,13 +2,15 @@
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 from spscand import __version__
-from spscand.api import State, serve
+from spscand.api import EventLog, State, serve
 from spscand.store import MempoolOutput, Output, Store
 
 
@@ -183,6 +185,48 @@ class ApiTest(unittest.TestCase):
             with self.subTest(bad):
                 self.assertEqual(self.post(f"{base}/v1/rescan", bad, token="s3cret")[0], 400)
         self.assertEqual(self.post(f"{base}/v1/rescan", {}, token=None)[0], 401)
+
+
+    def test_events_long_poll(self):
+        base = self.serve()
+        events = self.state.events
+        _, first = self.get(f"{base}/v1/events")
+        self.assertEqual((first["last"], first["events"], first["reset"]), (0, [], False))
+        boot = first["boot"]
+        events.add("output.unconfirmed", {"txid": "a" * 64})
+        _, body = self.get(f"{base}/v1/events?since=0&boot={boot}")
+        self.assertEqual([e["event"] for e in body["events"]], ["output.unconfirmed"])
+        self.assertEqual(body["last"], 1)
+
+        # A waiting request returns as soon as the next event arrives.
+        threading.Timer(0.5, events.add, ("block.scanned", {"height": 7})).start()
+        started = time.monotonic()
+        _, body = self.get(f"{base}/v1/events?since=1&boot={boot}&wait=20")
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual([e["data"] for e in body["events"]], [{"height": 7}])
+        # Nothing new: an empty answer once the wait is over.
+        started = time.monotonic()
+        _, body = self.get(f"{base}/v1/events?since=2&boot={boot}&wait=0.3")
+        self.assertGreaterEqual(time.monotonic() - started, 0.3)
+        self.assertEqual(body["events"], [])
+
+        # Another boot, or a position the log no longer holds: start over.
+        _, body = self.get(f"{base}/v1/events?since=2&boot=other")
+        self.assertTrue(body["reset"])
+        self.assertEqual(len(body["events"]), 2)
+        _, body = self.get(f"{base}/v1/events?since=9&boot={boot}")
+        self.assertTrue(body["reset"])
+        for bad in ("since=-1", "wait=61", "wait=x"):
+            self.assertEqual(self.get(f"{base}/v1/events?{bad}")[0], 400)
+
+    def test_event_log_forgets_old_events(self):
+        log = EventLog(size=3)
+        for n in range(5):
+            log.add("block.scanned", {"height": n})
+        body = log.since(1, log.boot, 0)
+        self.assertTrue(body["reset"])
+        self.assertEqual([e["seq"] for e in body["events"]], [3, 4, 5])
+        self.assertFalse(log.since(2, log.boot, 0)["reset"])
 
 
 if __name__ == "__main__":

@@ -170,7 +170,6 @@ def cmd_run(args) -> None:
     webhook = None
     if config.webhook_url:
         webhook = Webhook(config.webhook_url, network, secret=config.webhook_secret)
-        scanner.emit = webhook
 
     def addresses():
         labels = scanner.store.labels()
@@ -181,6 +180,13 @@ def cmd_run(args) -> None:
 
     state = State(network, config.backend, addresses())
     state.address_for = lambda m: scanner.receiver.address(network, m)
+
+    def emit(event: str, data: dict) -> None:
+        state.events.add(event, data)
+        if webhook:
+            webhook(event, data)
+
+    scanner.emit = emit
     watcher = None
     mempool_core = config.make_mempool_source(scanner.backend)
     if mempool_core is not None:
@@ -217,6 +223,7 @@ def cmd_run(args) -> None:
             with scanner.store.transaction():
                 scanner.store.rewind(rescan_from - 1)
             log.info("rescanning from height %d, as asked through the API", rescan_from)
+            state.events.add("rescan.started", {"from": rescan_from})
             next_sync = 0.0
         new_block = False
         # Scan a new block at once only when the mempool node is also the block
@@ -229,7 +236,11 @@ def cmd_run(args) -> None:
                 pass  # reported by the poll below
         if new_block or time.monotonic() >= next_sync:
             try:
+                before = scanner.store.scanned_height()
                 scanner.sync(stop)
+                if scanner.store.scanned_height() != before:
+                    state.events.add("block.scanned",
+                                     {"height": scanner.store.scanned_height()})
                 with state.lock:
                     state.tip, state.error = scanner.tip, None
                 delay = config.poll_seconds

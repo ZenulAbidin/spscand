@@ -139,6 +139,13 @@ on any other address needs a token, and so does every `POST`.
 | `GET /v1/balance[?min_conf=N]` | unspent total in satoshis, plus `pending_in` and `pending_out` |
 | `POST /v1/labels` `{"m": M, "comment": "…"}` | register a label (without `m`, the next free number) and return its address |
 | `POST /v1/rescan` `{"from": H}` | forget results from height H on (default: the birthday) and scan again |
+| `GET /v1/events?since=N&boot=B&wait=S` | events after number N, waiting up to S seconds (at most 60) for one |
+
+`/v1/events` returns `{"boot", "last", "reset", "events"}`; each event has a `seq` number, a name, a
+time and data. Pass the last `seq` you saw as `since` and the `boot` id you got. Events are kept in
+memory only (the last 1000): if spscand restarted or you fell behind, `reset` is true and you should
+read the outputs again. Besides the webhook events there are `block.scanned`, `label.added` and
+`rescan.started`.
 
 Each output has a `status`. A `confirmed` one has a height and confirmations. An `unconfirmed` one
 pays us from a transaction still in the mempool: it has `confirmations: 0` and no height, is listed

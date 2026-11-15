@@ -5,8 +5,11 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import secrets
 import sqlite3
 import threading
+import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -15,6 +18,43 @@ from . import __version__
 from .store import MempoolOutput, Output
 
 log = logging.getLogger("spscand")
+
+
+class EventLog:
+    """Recent scanner events, numbered, for clients waiting on /v1/events.
+
+    Kept in memory only: after a restart the boot id changes, and a client
+    that missed events (or comes back after a restart) is told to reset and
+    read the outputs again.
+    """
+
+    MAX_WAIT = 60
+
+    def __init__(self, size: int = 1000) -> None:
+        self.boot = secrets.token_hex(8)
+        self.seq = 0
+        self.events: deque = deque(maxlen=size)
+        self.changed = threading.Condition()
+
+    def add(self, event: str, data: dict) -> None:
+        with self.changed:
+            self.seq += 1
+            self.events.append({"seq": self.seq, "event": event, "time": int(time.time()),
+                                "data": data})
+            self.changed.notify_all()
+
+    def since(self, seq: int, boot: str | None, wait: float) -> dict:
+        deadline = time.monotonic() + min(max(wait, 0), self.MAX_WAIT)
+        with self.changed:
+            oldest = self.events[0]["seq"] if self.events else self.seq + 1
+            reset = (boot is not None and boot != self.boot) or seq > self.seq \
+                or seq < oldest - 1
+            if reset:
+                seq = 0
+            while not reset and self.seq <= seq and (left := deadline - time.monotonic()) > 0:
+                self.changed.wait(left)
+            return {"boot": self.boot, "last": self.seq, "reset": reset,
+                    "events": [e for e in self.events if e["seq"] > seq]}
 
 
 class State:
@@ -34,6 +74,7 @@ class State:
         self.rescan_from: int | None = None
         # Set to make "spscand run" act at once instead of after its poll interval.
         self.wake = threading.Event()
+        self.events = EventLog()
         self.lock = threading.Lock()
 
 
@@ -170,6 +211,7 @@ def serve(listen: str, db_path: Path, state: State, token: str = "") -> Threadin
                     state.addresses = [a for a in state.addresses
                                        if a.get("label") != m] + [entry]
                 state.wake.set()  # scan for the new label from now on
+                state.events.add("label.added", entry)
                 return entry
             if path == "/v1/rescan":
                 height = body.get("from")
@@ -216,6 +258,13 @@ def serve(listen: str, db_path: Path, state: State, token: str = "") -> Threadin
                 }
             if path == "/v1/addresses":
                 return state.addresses
+            if path == "/v1/events":
+                since = int(query.get("since", "0"))
+                wait = float(query.get("wait", "0"))
+                if since < 0 or not 0 <= wait <= EventLog.MAX_WAIT:
+                    raise ValueError(f"since must not be negative, wait at most "
+                                     f"{EventLog.MAX_WAIT} seconds")
+                return state.events.since(since, query.get("boot"), wait)
             if path in ("/v1/outputs", "/v1/balance"):
                 min_conf = int(query.get("min_conf", "1"))
                 unspent_only = path == "/v1/balance" or query.get("unspent") in ("1", "true")
