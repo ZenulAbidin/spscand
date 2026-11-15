@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -30,6 +31,29 @@ CREATE TABLE IF NOT EXISTS outputs (
     PRIMARY KEY (txid, vout)
 );
 CREATE INDEX IF NOT EXISTS outputs_unspent ON outputs (spent_height) WHERE spent_height IS NULL;
+-- Unconfirmed transactions that pay us or spend one of our outputs, with
+-- their inputs (a JSON list of [txid, vout]) to tell why one disappeared.
+CREATE TABLE IF NOT EXISTS mempool_txs (
+    txid TEXT PRIMARY KEY,
+    inputs TEXT NOT NULL,
+    seen INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mempool_outputs (
+    txid TEXT NOT NULL,
+    vout INTEGER NOT NULL,
+    amount INTEGER NOT NULL,
+    pubkey TEXT NOT NULL,
+    tweak TEXT NOT NULL,
+    label INTEGER,
+    PRIMARY KEY (txid, vout)
+);
+-- Our outputs (confirmed or not) spent by an unconfirmed transaction.
+CREATE TABLE IF NOT EXISTS mempool_spends (
+    txid TEXT NOT NULL,
+    vout INTEGER NOT NULL,
+    spent_txid TEXT NOT NULL,
+    PRIMARY KEY (txid, vout)
+);
 """
 
 
@@ -50,6 +74,24 @@ class Output:
         data = dict(self.__dict__)
         if tip is not None:
             data["confirmations"] = max(0, tip - self.height + 1)
+        return data
+
+
+@dataclass(frozen=True)
+class MempoolOutput:
+    """An output paying us in an unconfirmed transaction."""
+
+    txid: str
+    vout: int
+    amount: int
+    pubkey: str
+    tweak: str
+    label: int | None
+
+    def as_dict(self) -> dict:
+        data = dict(self.__dict__)
+        data.update(height=None, block_hash=None, spent_txid=None, spent_height=None,
+                    confirmations=0, status="unconfirmed")
         return data
 
 
@@ -162,3 +204,57 @@ class Store:
 
     def outputs(self, *, unspent_only: bool = False) -> list[Output]:
         return self._outputs("WHERE spent_height IS NULL" if unspent_only else "")
+
+    def add_mempool_tx(self, txid: str, inputs: list[tuple[str, int]], seen: int,
+                       outputs: list[MempoolOutput], spends: list[tuple[str, int]]) -> None:
+        """Record an unconfirmed transaction that pays us or spends our outputs."""
+        self.db.execute("INSERT OR REPLACE INTO mempool_txs VALUES (?, ?, ?)",
+                        (txid, json.dumps([list(i) for i in inputs]), seen))
+        for o in outputs:
+            self.db.execute("INSERT OR REPLACE INTO mempool_outputs VALUES (?, ?, ?, ?, ?, ?)",
+                            (o.txid, o.vout, o.amount, o.pubkey, o.tweak, o.label))
+        for outpoint in spends:
+            self.db.execute("INSERT OR REPLACE INTO mempool_spends VALUES (?, ?, ?)",
+                            (*outpoint, txid))
+
+    def mempool_txids(self) -> set[str]:
+        return {row[0] for row in self.db.execute("SELECT txid FROM mempool_txs")}
+
+    def mempool_inputs(self, txid: str) -> list[tuple[str, int]]:
+        row = self.db.execute("SELECT inputs FROM mempool_txs WHERE txid = ?", (txid,)).fetchone()
+        return [tuple(i) for i in json.loads(row[0])] if row else []
+
+    def mempool_outputs(self, txid: str | None = None) -> list[MempoolOutput]:
+        where, params = ("WHERE txid = ?", (txid,)) if txid else ("", ())
+        rows = self.db.execute(f"SELECT * FROM mempool_outputs {where} ORDER BY txid, vout",
+                               params)
+        return [MempoolOutput(*row) for row in rows]
+
+    def mempool_spends(self, txid: str | None = None) -> dict[tuple[str, int], str]:
+        """Our outpoints spent in the mempool, with the spending txid."""
+        where, params = ("WHERE spent_txid = ?", (txid,)) if txid else ("", ())
+        rows = self.db.execute(f"SELECT txid, vout, spent_txid FROM mempool_spends {where}",
+                               params)
+        return {(row[0], row[1]): row[2] for row in rows}
+
+    def remove_mempool_tx(self, txid: str) -> None:
+        self.db.execute("DELETE FROM mempool_txs WHERE txid = ?", (txid,))
+        self.db.execute("DELETE FROM mempool_outputs WHERE txid = ?", (txid,))
+        self.db.execute("DELETE FROM mempool_spends WHERE spent_txid = ?", (txid,))
+
+    def drop_confirmed_mempool(self) -> list[str]:
+        """After a block: forget mempool outputs now found in a block, and
+        mempool spends of outputs now spent in a block (by that transaction or
+        a conflicting one; BlindBit does not say which). Returns the txids of
+        unconfirmed transactions left with nothing to track."""
+        self.db.execute(
+            "DELETE FROM mempool_outputs WHERE (txid, vout) IN (SELECT txid, vout FROM outputs)")
+        self.db.execute(
+            "DELETE FROM mempool_spends WHERE (txid, vout) IN "
+            "(SELECT txid, vout FROM outputs WHERE spent_height IS NOT NULL)")
+        done = [row[0] for row in self.db.execute(
+            "SELECT txid FROM mempool_txs WHERE txid NOT IN (SELECT txid FROM mempool_outputs) "
+            "AND txid NOT IN (SELECT spent_txid FROM mempool_spends)")]
+        for txid in done:
+            self.remove_mempool_tx(txid)
+        return done
