@@ -7,6 +7,7 @@ import getpass
 import json
 import logging
 import os
+import secrets
 import signal
 import sys
 import threading
@@ -131,6 +132,53 @@ def cmd_rescan(args) -> None:
     with store.transaction():
         store.rewind(height - 1)
     print(f"will rescan from height {height}")
+
+
+def _set_api_token(config_path: Path, token: str) -> None:
+    """Write [api] token into spscand.toml, keeping everything else as it is."""
+    lines = config_path.read_text().splitlines()
+    section, done = None, False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            if section == "api" and not done:
+                lines.insert(i, f'token = "{token}"')
+                done = True
+                break
+            section = stripped.strip("[]").strip()
+        elif section == "api" and stripped.split("=", 1)[0].strip() == "token":
+            lines[i] = f'token = "{token}"'
+            done = True
+            break
+    if not done:
+        if section != "api":
+            lines += ["", "[api]"]
+        lines.append(f'token = "{token}"')
+    config_path.write_text("\n".join(lines) + "\n")
+    config_path.chmod(0o600)
+
+
+def cmd_pair(args) -> None:
+    from urllib.parse import urlencode
+
+    store, receiver, network = _open(args)
+    _, config_path = _paths(args)
+    config = Config.load(config_path)
+    url = args.url
+    if url is None:
+        host, _, port = config.api_listen.rpartition(":")
+        if host.strip("[]") not in ("127.0.0.1", "::1", "localhost"):
+            raise SystemExit("the API listens beyond loopback: give the address the wallet "
+                             "will use with --url (for example your .onion address)")
+        url = f"http://{host}:{port}"
+    token = config.api_token
+    if not token:
+        token = secrets.token_hex(16)
+        _set_api_token(config_path, token)
+        print("A new API token was written to spscand.toml; restart 'spscand run' to use it.",
+              file=sys.stderr)
+    print("spscand://pair?" + urlencode({"url": url, "token": token, "network": network,
+                                          "address": receiver.address(network)}))
 
 
 def _close(backend) -> None:
@@ -315,6 +363,12 @@ def main(argv=None) -> None:
     add.add_argument("--comment", default="")
     labels.add_parser("list")
     p.set_defaults(func=cmd_label)
+
+    p = sub.add_parser("pair", help="print a pairing string for a wallet, such as Electrum's "
+                                    "Silent Payments plugin (sets an API token if there is none)")
+    p.add_argument("--url", help="the API address as the wallet reaches it, e.g. "
+                                 "http://xyz.onion:7352 (default: the loopback listen address)")
+    p.set_defaults(func=cmd_pair)
 
     p = sub.add_parser("outputs", help="list found outputs (unspent by default)")
     p.add_argument("--all", action="store_true")

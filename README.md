@@ -47,10 +47,16 @@ spscand run
 | `sync` | scan to the tip once and exit |
 | `address [--label M]` | print the address |
 | `label add M` / `label list` | register a label and print its address |
+| `pair [--url URL]` | print a pairing string for a wallet, setting an API token if there is none |
 | `outputs [--all]` | list unspent (or all) found outputs as JSON |
 | `rescan [--from H]` | forget results from height H on and scan again |
 
 `--datadir` or `SPSCAND_DATADIR` sets the data directory (default `~/.spscand`).
+
+`pair` prints `spscand://pair?url=…&token=…&network=…&address=…` for a wallet that reads the API,
+such as Electrum's Silent Payments plugin. If the API listens beyond loopback (for example behind a
+Tor onion service), give the address the wallet will use: `spscand pair --url http://xyz.onion:7352`.
+The string holds the API token: whoever has it can see your payments.
 
 ## Unconfirmed payments
 
