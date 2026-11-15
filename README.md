@@ -52,6 +52,29 @@ spscand run
 
 `--datadir` or `SPSCAND_DATADIR` sets the data directory (default `~/.spscand`).
 
+## Unconfirmed payments
+
+`spscand run` also lists payments still in the mempool, if it has a Bitcoin Core node to watch:
+
+| Backend | Unconfirmed payments |
+|---|---|
+| `core` | yes, from the same node (`[mempool] source = "auto"`, the default) |
+| `blindbit` | only with `[mempool] source = "core"` and a node in `rpc_url`: BlindBit serves mined blocks only |
+| `filters` | only with `[mempool] source = "core"` and a node in `rpc_url`: tweaks need each input's spent output, which P2P peers cannot look up without being asked about specific transactions |
+
+Every transaction in the node's mempool is fetched and checked, as blocks are, so the node is not
+asked anything that singles out your payments. A pruned node is enough. The mempool is checked
+every `[mempool] poll_seconds` (default 5).
+
+An unconfirmed payment is listed with `status: "unconfirmed"` and 0 confirmations, and counted in
+`pending_in`, never in the balance. When its transaction is mined it becomes a confirmed output.
+If the transaction leaves the mempool unmined, the payment is dropped, with the reason in the
+webhook: `replaced` (another transaction spends one of its inputs, as with RBF), `conflicted` (an
+input was spent in a block, or its unconfirmed parent was dropped) or `evicted` (expired or pushed
+out of a full mempool). A replacement that still pays you is listed as a new unconfirmed payment.
+After a reorg, payments in blocks that were rolled back show up as unconfirmed again until they are
+mined again. Don't treat an unconfirmed payment as paid: the sender can still replace it.
+
 ## Privacy
 
 With the Core backend, nothing leaves your machine.
@@ -125,7 +148,10 @@ unconfirmed transaction spends the output, and `pending_out` sums confirmed outp
 
 With `[webhook] url` set, spscand POSTs `{"event", "network", "time", "data"}` for `output.received`,
 `output.spent`, `output.reorged` (its block was reorged out) and `output.unspent` (its spend was reorged
-out); `data` is the output. With a `secret`, the body is signed in `X-Spscand-Signature: sha256=<HMAC-SHA256 hex>`. Failed
+out, or an unconfirmed spend was dropped); `data` is the output. With a mempool source there are also
+`output.unconfirmed` (a payment in the mempool), `output.removed` (it left the mempool unmined; `data`
+has a `reason`) and `output.spending` (an unconfirmed transaction spends it, in
+`pending_spent_txid`). With a `secret`, the body is signed in `X-Spscand-Signature: sha256=<HMAC-SHA256 hex>`. Failed
 deliveries are retried for about 6 minutes.
 
 ## Public scanning service
@@ -169,7 +195,7 @@ reverse proxy with TLS and rate limits in front; `contrib/spscan-web.service` is
 
 ## Limits
 
-- Confirmed blocks only: mempool payments are not reported.
+- Unconfirmed payments need a Bitcoin Core node (see above).
 - With BlindBit, spends are matched by an 8-byte key prefix, and the spending txid is unknown.
 - BlindBit has deprecated its JSON API in favour of gRPC, but spscand uses the JSON API.
 - The filters backend still needs BlindBit for tweaks; peers serve only filters and blocks. With it,
@@ -188,7 +214,9 @@ real BlindBit index (also over SOCKS5 under a `.onion` name), the scanner logic,
 against fake peers (including lying ones), and libspscan against the Python code. They use libspscan
 when it is built; `SPSCAND_PURE_PYTHON=1` runs them without it. The end-to-end test pays spscand on
 regtest from the BIP352 reference sender with P2WPKH, P2SH-P2WPKH, P2PKH and P2TR inputs, then checks
-labels, spending, spend detection, reorgs, rescans, the API and the webhook:
+labels, spending, spend detection, reorgs, rescans, the API and the webhook, and with the mempool:
+unconfirmed payments and spends, confirmation, RBF replacements, a conflicting block and a reorg
+back into the mempool:
 
 ```bash
 python3 tests/regtest_e2e.py --bitcoin-conf /path/to/regtest/bitcoin.conf --workdir ~/spscand-e2e
@@ -197,7 +225,9 @@ python3 tests/regtest_e2e.py --bitcoin-conf /path/to/regtest/bitcoin.conf --work
 `--backend blindbit --blindbit-url URL` runs it against a BlindBit server (`tests/fake_blindbit.py`
 serves BlindBit's JSON from the regtest node). `--backend filters` starts a second regtest node serving
 filters, and checks that only blocks paying or spending your outputs were downloaded. `--via-socks`
-routes the backend through a test SOCKS5 server and checks that nothing bypassed it.
+routes the backend through a test SOCKS5 server and checks that nothing bypassed it. With
+`blindbit` and `filters` the regtest node is also the mempool source; `--no-mempool` turns that off.
+Eviction and expiry cannot be forced on regtest; `tests/test_mempool.py` covers them with a fake node.
 
 ## License
 
