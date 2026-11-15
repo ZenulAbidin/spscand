@@ -128,7 +128,8 @@ block (address reuse) is recorded too.
 
 ## API
 
-Read-only HTTP on `127.0.0.1:7352`. If `[api] token` is set, send `Authorization: Bearer <token>`.
+HTTP on `127.0.0.1:7352`. If `[api] token` is set, send `Authorization: Bearer <token>`. Listening
+on any other address needs a token, and so does every `POST`.
 
 | Endpoint | |
 |---|---|
@@ -136,6 +137,7 @@ Read-only HTTP on `127.0.0.1:7352`. If `[api] token` is set, send `Authorization
 | `GET /v1/addresses` | the address and each label's address |
 | `GET /v1/outputs[?unspent=1][&since_height=H]` | found outputs with confirmations; with `since_height`, only those received or spent at height H or later (after a reorg, fetch all again) |
 | `GET /v1/balance[?min_conf=N]` | unspent total in satoshis, plus `pending_in` and `pending_out` |
+| `POST /v1/labels` `{"m": M, "comment": "…"}` | register a label (without `m`, the next free number) and return its address |
 
 Each output has a `status`. A `confirmed` one has a height and confirmations. An `unconfirmed` one
 pays us from a transaction still in the mempool: it has `confirmations: 0` and no height, is listed

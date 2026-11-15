@@ -1,4 +1,4 @@
-"""Read-only local JSON API."""
+"""Local JSON API: reads, plus a few changes that need the token."""
 
 from __future__ import annotations
 
@@ -28,6 +28,8 @@ class State:
         self.error: str | None = None
         # None without a mempool source, else {"source", "transactions", "error"}.
         self.mempool: dict | None = None
+        # The address for a label number; set by "spscand run".
+        self.address_for = None
         self.lock = threading.Lock()
 
 
@@ -70,6 +72,24 @@ def _read_mempool(path: Path) -> tuple[list[MempoolOutput], dict[tuple[str, int]
         db.close()
 
 
+MAX_BODY = 4096
+
+
+def _add_label(path: Path, m: int | None, comment: str) -> int:
+    """Register a label (the next free number if m is None); returns its number."""
+    db = sqlite3.connect(path, timeout=30, isolation_level=None)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        if m is None:
+            m = db.execute("SELECT COALESCE(MAX(m), 0) + 1 FROM labels").fetchone()[0]
+        db.execute("INSERT INTO labels (m, comment) VALUES (?, ?) "
+                   "ON CONFLICT (m) DO UPDATE SET comment = excluded.comment", (m, comment))
+        db.execute("COMMIT")
+        return m
+    finally:
+        db.close()
+
+
 def serve(listen: str, db_path: Path, state: State, token: str = "") -> ThreadingHTTPServer:
     host, _, port = listen.rpartition(":")
     host = host.strip("[]") or "127.0.0.1"
@@ -91,12 +111,57 @@ def serve(listen: str, db_path: Path, state: State, token: str = "") -> Threadin
             self.end_headers()
             self.wfile.write(body)
 
-        def do_GET(self) -> None:
+        def _authorized(self) -> bool:
             if token:
                 given = self.headers.get("Authorization", "")
                 if not hmac.compare_digest(given.encode(), f"Bearer {token}".encode()):
                     self._send(401, {"error": "unauthorized"})
-                    return
+                    return False
+            return True
+
+        def do_POST(self) -> None:
+            if not token:
+                self._send(403, {"error": "changes need [api] token to be set"})
+                return
+            if not self._authorized():
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 <= length <= MAX_BODY:
+                    raise ValueError("request body too large")
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("the request body must be a JSON object")
+                payload = self._change(urlsplit(self.path).path, body)
+            except ValueError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            if payload is None:
+                self._send(404, {"error": "not found"})
+            else:
+                self._send(200, payload)
+
+        def _change(self, path: str, body: dict):
+            if path == "/v1/labels":
+                m = body.get("m")
+                comment = body.get("comment", "")
+                if m is not None and (isinstance(m, bool) or not isinstance(m, int)
+                                      or not 1 <= m < 2**32):
+                    raise ValueError("labels are numbered from 1 (0 is the change label)")
+                if not isinstance(comment, str) or len(comment) > 200:
+                    raise ValueError("comment must be text of up to 200 characters")
+                m = _add_label(db_path, m, comment)
+                address = state.address_for(m) if state.address_for else None
+                entry = {"label": m, "comment": comment, "address": address}
+                with state.lock:
+                    state.addresses = [a for a in state.addresses
+                                       if a.get("label") != m] + [entry]
+                return entry
+            return None
+
+        def do_GET(self) -> None:
+            if not self._authorized():
+                return
             url = urlsplit(self.path)
             query = {k: v[-1] for k, v in parse_qs(url.query).items()}
             try:

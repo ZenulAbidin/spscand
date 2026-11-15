@@ -180,6 +180,7 @@ def cmd_run(args) -> None:
         ]
 
     state = State(network, config.backend, addresses())
+    state.address_for = lambda m: scanner.receiver.address(network, m)
     watcher = None
     mempool_core = config.make_mempool_source(scanner.backend)
     if mempool_core is not None:

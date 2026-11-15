@@ -32,6 +32,16 @@ class ApiTest(unittest.TestCase):
         self.servers.append(server)
         return f"http://127.0.0.1:{server.server_address[1]}"
 
+    def post(self, url, body, token=None):
+        request = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+        if token is not None:
+            request.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.load(exc)
+
     def get(self, url, token=None):
         request = urllib.request.Request(url)
         if token is not None:
@@ -127,6 +137,36 @@ class ApiTest(unittest.TestCase):
         self.state.mempool = {"source": "core", "transactions": 12, "error": None}
         _, status_body = self.get(f"{base}/v1/status")
         self.assertEqual(status_body["mempool"]["transactions"], 12)
+
+
+    def test_changes_need_a_token(self):
+        base = self.serve()
+        status, body = self.post(f"{base}/v1/labels", {"comment": "shop"})
+        self.assertEqual(status, 403)
+        base = self.serve(token="s3cret")
+        self.assertEqual(self.post(f"{base}/v1/labels", {}, token="wrong")[0], 401)
+        self.assertEqual(self.store.labels(), {})
+
+    def test_add_labels(self):
+        self.state.address_for = lambda m: f"sprt1label{m}"
+        base = self.serve(token="s3cret")
+        status, body = self.post(f"{base}/v1/labels", {"comment": "shop"}, token="s3cret")
+        self.assertEqual((status, body), (200, {"label": 1, "comment": "shop",
+                                                "address": "sprt1label1"}))
+        status, body = self.post(f"{base}/v1/labels", {}, token="s3cret")
+        self.assertEqual(body["label"], 2)
+        status, body = self.post(f"{base}/v1/labels", {"m": 7, "comment": "x"}, token="s3cret")
+        self.assertEqual(body["label"], 7)
+        status, body = self.post(f"{base}/v1/labels", {"m": 1, "comment": "café"},
+                                 token="s3cret")
+        self.assertEqual(self.store.labels(), {1: "café", 2: "", 7: "x"})
+        _, addresses = self.get(f"{base}/v1/addresses", token="s3cret")
+        self.assertEqual(sorted(a["label"] for a in addresses if a["label"]), [1, 2, 7])
+        for bad in ({"m": 0}, {"m": -1}, {"m": True}, {"m": "1"}, {"comment": 5},
+                    {"comment": "x" * 201}):
+            with self.subTest(bad):
+                self.assertEqual(self.post(f"{base}/v1/labels", bad, token="s3cret")[0], 400)
+        self.assertEqual(self.post(f"{base}/v1/nothing", {}, token="s3cret")[0], 404)
 
 
 if __name__ == "__main__":
