@@ -26,6 +26,8 @@ NODE_COMPACT_FILTERS = 1 << 6
 MSG_BLOCK = 2
 BASIC_FILTER = 0
 MAX_MESSAGE = 32 * 1024 * 1024  # Core's limit on a message (a block) is 32 MB
+# A peer that has not indexed a block's filter yet stays silent; ask again later.
+FILTER_TIMEOUT = 30
 
 
 class P2PError(OSError):
@@ -204,12 +206,21 @@ class Peer:
             self.send("pong", payload)
         return command, payload
 
-    def wait_for(self, *commands: str) -> tuple[str, bytes]:
-        deadline = time.monotonic() + self.timeout
-        while time.monotonic() < deadline:
-            command, payload = self.recv()
-            if command in commands:
-                return command, payload
+    def wait_for(self, *commands: str, timeout: float | None = None) -> tuple[str, bytes]:
+        """The next of these messages, skipping others. Every read is bounded
+        by the deadline: a peer sending pings and invs while ignoring the
+        request cannot hold us past it."""
+        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
+        try:
+            while (left := deadline - time.monotonic()) > 0:
+                self.sock.settimeout(left)
+                command, payload = self.recv()
+                if command in commands:
+                    return command, payload
+        except TimeoutError:
+            pass  # the stream may now be mid-message: the caller drops the connection
+        finally:
+            self.sock.settimeout(self.timeout)
         raise P2PError(f"{self} did not answer in time")
 
     def _handshake(self) -> None:
@@ -234,7 +245,8 @@ class Peer:
         """(previous filter header, filter hashes) for heights start..stop."""
         stop = bytes.fromhex(stop_hash)[::-1]
         self.send("getcfheaders", bytes([BASIC_FILTER]) + struct.pack("<I", start) + stop)
-        _, payload = self.wait_for("cfheaders")
+        # Core does not answer at all for a block it has not indexed yet.
+        _, payload = self.wait_for("cfheaders", timeout=min(self.timeout, FILTER_TIMEOUT))
         r = Reader(payload)
         if r.take(1)[0] != BASIC_FILTER or r.take(32) != stop:
             raise P2PError(f"{self} answered another cfheaders request")
@@ -247,7 +259,7 @@ class Peer:
         self.send("getcfilters", bytes([BASIC_FILTER]) + struct.pack("<I", start) + stop)
         filters = []
         while len(filters) < count:
-            _, payload = self.wait_for("cfilter")
+            _, payload = self.wait_for("cfilter", timeout=min(self.timeout, FILTER_TIMEOUT))
             r = Reader(payload)
             if r.take(1)[0] != BASIC_FILTER:
                 raise P2PError(f"{self} sent a filter of another type")

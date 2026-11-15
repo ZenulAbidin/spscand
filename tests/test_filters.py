@@ -4,7 +4,9 @@ import json
 import random
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -153,9 +155,9 @@ class FilterBackendTest(unittest.TestCase):
         block = self.chain.add(txs, spent_scripts)
         self.server.tweaks[block.height] = [t.serialize().hex() for t in tweaks]
 
-    def scanner(self, peers=None, proxy=""):
+    def scanner(self, peers=None, proxy="", timeout=10):
         backend = FilterBackend(self.server.url, [p.address for p in (peers or self.peers)],
-                                proxy=proxy, timeout=10)
+                                proxy=proxy, timeout=timeout)
         self.assertEqual(backend.network(), "regtest")
         self.addCleanup(backend.close)
         return Scanner(self.store, self.receiver, backend), backend
@@ -189,6 +191,23 @@ class FilterBackendTest(unittest.TestCase):
         with self.assertRaisesRegex(BackendError, "peers disagree"):
             scanner.sync()
         self.assertEqual(self.store.outputs(), [])
+
+    def test_unanswered_filter_request_times_out(self):
+        # Core ignores a request for a block whose filter it has not indexed
+        # yet, while still sending pings: give up at the deadline, retry later.
+        tip = len(self.chain.blocks) - 1
+        for peer in self.peers:
+            peer.unindexed.add(tip)
+        scanner, _ = self.scanner(timeout=3)
+        started = time.monotonic()
+        with mock.patch.object(p2p, "FILTER_TIMEOUT", 0.5), \
+                self.assertRaisesRegex(BackendError, "no peer served filter headers"):
+            scanner.sync()
+        self.assertLess(time.monotonic() - started, 2.5)
+        for peer in self.peers:
+            peer.unindexed.clear()
+        self.assertEqual(scanner.sync(), 4)
+        self.assertEqual(len(self.store.outputs()), 2)
 
     def test_unreachable_peer_is_skipped(self):
         scanner, _ = self.scanner(peers=[self.peers[0]])

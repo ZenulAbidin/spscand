@@ -7,6 +7,7 @@ import secrets
 import socketserver
 import struct
 import threading
+import time
 
 from spscand import native
 from spscand.p2p import (BASIC_FILTER, MAGIC, NODE_COMPACT_FILTERS, NODE_NETWORK, Reader,
@@ -87,6 +88,7 @@ class FakePeer:
         self.services = NODE_NETWORK | NODE_COMPACT_FILTERS
         self.lie_filter_at: int | None = None   # serve a wrong filter for this height
         self.lie_header_at: int | None = None   # and a matching false header chain
+        self.unindexed: set[int] = set()  # heights whose filters it ignores requests for, as Core
         self.requests: list[tuple[str, object]] = []
         self.connections = 0
         peer = self
@@ -131,6 +133,11 @@ class FakePeer:
                     start = struct.unpack("<I", payload[1:5])[0]
                     stop_hash = payload[5:37]
                     stop = next(b.height for b in peer.chain.blocks if b.hash == stop_hash)
+                    if stop in peer.unindexed:
+                        time.sleep(0.4)  # no answer; one ping, then silence
+                        self.send("ping", bytes(8))
+                        time.sleep(4)
+                        return
                     filters = [b.filter for b in peer.chain.blocks]
                     if peer.lie_filter_at is not None:
                         filters[peer.lie_filter_at] = native.gcs_build(
