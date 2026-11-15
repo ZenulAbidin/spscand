@@ -47,7 +47,8 @@ def serve(listen: str, db_path: Path, state: State, token: str = "") -> Threadin
     host, _, port = listen.rpartition(":")
     host = host.strip("[]") or "127.0.0.1"
     if not token and host not in ("127.0.0.1", "::1", "localhost"):
-        log.warning("API on %s has no token: anyone who can connect sees your payments", host)
+        raise ValueError(f"the API on {host} needs a token: set [api] token, or listen on "
+                         "127.0.0.1")
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "spscand"

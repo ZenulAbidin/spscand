@@ -48,6 +48,7 @@ poll_seconds = 30
 
 [api]
 # Read-only JSON API. Keep it on loopback; set a token if other local users exist.
+# Listening on any other address needs a token.
 listen = "127.0.0.1:7352"
 token = ""
 
