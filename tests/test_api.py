@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from spscand import __version__
 from spscand.api import State, serve
 from spscand.store import Store
 
@@ -53,6 +54,12 @@ class ApiTest(unittest.TestCase):
         status, body = self.get(f"{base}/v1/status", token="s3cret")
         self.assertEqual(status, 200)
         self.assertEqual(body["network"], "regtest")
+
+    def test_status_reports_version(self):
+        status, body = self.get(f"{self.serve()}/v1/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["version"], __version__)
+        self.assertIsNone(body["scanned_height"])
 
 
 if __name__ == "__main__":

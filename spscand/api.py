@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from . import __version__
 from .store import Output
 
 log = logging.getLogger("spscand")
@@ -88,6 +89,7 @@ def serve(listen: str, db_path: Path, state: State, token: str = "") -> Threadin
                 with state.lock:
                     tip, error = state.tip, state.error
                 return {
+                    "version": __version__,
                     "network": state.network,
                     "backend": state.backend,
                     "scanned_height": scanned,

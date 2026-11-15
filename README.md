@@ -109,7 +109,7 @@ Read-only HTTP on `127.0.0.1:7352`. If `[api] token` is set, send `Authorization
 
 | Endpoint | |
 |---|---|
-| `GET /v1/status` | network, backend, scanned height, tip, last error |
+| `GET /v1/status` | spscand version, network, backend, scanned height, tip, last error |
 | `GET /v1/addresses` | the address and each label's address |
 | `GET /v1/outputs[?unspent=1]` | found outputs with confirmations |
 | `GET /v1/balance[?min_conf=N]` | unspent total in satoshis |
