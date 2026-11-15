@@ -127,6 +127,25 @@ class CoreBackend:
             raise BackendError(f"{method}: {reply['error'].get('message', reply['error'])}")
         return reply["result"]
 
+    def call_many(self, method: str, params: list[list]) -> list:
+        """One JSON-RPC batch of the same method; None where a call failed
+        (for example a transaction that just left the mempool)."""
+        if not params:
+            return []
+        first = self._id + 1
+        self._id += len(params)
+        request = urllib.request.Request(
+            self.url,
+            data=json.dumps([{"jsonrpc": "1.0", "id": first + i, "method": method,
+                              "params": list(p)} for i, p in enumerate(params)]).encode(),
+            headers={"Content-Type": "application/json", "Authorization": self._auth()},
+        )
+        replies = self.http.json(request)
+        if not isinstance(replies, list):
+            raise BackendError(f"bad RPC batch reply to {method}")
+        by_id = {r.get("id"): r for r in replies if isinstance(r, dict)}
+        return [by_id.get(first + i, {}).get("result") for i in range(len(params))]
+
     def network(self) -> str:
         version = self.call("getnetworkinfo")["version"]
         if version < 250000:

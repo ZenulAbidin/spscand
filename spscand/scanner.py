@@ -128,6 +128,7 @@ class Scanner:
                     self.store.mark_spent(output.txid, output.vout, spender or None, block.height)
                     spent.append(output)
             self.store.record_block(block.height, block.hash)
+            self.store.drop_confirmed_mempool()
         for output in received:
             log.info("received %d sat in %s:%d (label %s) at height %d", output.amount,
                      output.txid, output.vout, output.label, output.height)
